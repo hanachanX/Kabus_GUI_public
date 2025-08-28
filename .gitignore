@@ -180,3 +180,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignorescalper/sim_logs/
 *.bak
+
+
+scalper/sim_logs/
+*.bak
+*.csv
