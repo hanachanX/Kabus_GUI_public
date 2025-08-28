@@ -1,0 +1,59 @@
+# 最小学習スクリプト: features_*.csv -> ラベル付け -> 学習 -> モデル保存
+import glob, os, math
+import pandas as pd
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from joblib import dump
+
+LOOKAHEAD_SEC = 3
+THRESH_TICKS = 0.5  # 0.5 tick 相当で動いたら up/down とみなす
+DEFAULT_TICK = 0.5
+
+def load_all():
+    paths = sorted(glob.glob(os.path.join("sim_logs","features","features_*.csv")))
+    df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
+    # ミッド生成
+    df["mid"] = (df["best_bid"].astype(float) + df["best_ask"].astype(float))/2.0
+    # 同一日ファイル内で近似的に lookahead 行ずらし（1秒/行程度の想定）
+    # 実運用は正確なタイムスタンプで forward fill / merge_asof を推奨
+    df["mid_fwd"] = df.groupby("symbol")["mid"].shift(-LOOKAHEAD_SEC)  # ≒ 1row≒1sec の簡易想定
+    # ラベル
+    delta = df["mid_fwd"] - df["mid"]
+    thr = THRESH_TICKS * DEFAULT_TICK
+    df["y"] = (delta > thr).astype(int) - (delta < -thr).astype(int)   # +1 / 0 / -1
+    df = df.dropna(subset=["y"])
+    return df
+
+def main():
+    df = load_all()
+    feats = [
+        "spread","imb","microprice","vwap","sma25","macd","macd_sig","rsi",
+        "swing_higher_lows","swing_lower_highs","mom_0p7s","last"
+    ]
+    X = df[feats].astype(float).fillna(0.0)
+    # 3値 → 2値化（最初はシンプルにup vs not-up、down側は別モデルでもOK）
+    y = (df["y"] == 1).astype(int)
+
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=200))
+    ])
+
+    tscv = TimeSeriesSplit(n_splits=5)
+    # ざっくり学習（評価は後続で強化）
+    for tr, va in tscv.split(X):
+        pipe.fit(X.iloc[tr], y.iloc[tr])
+        print("fold acc=", pipe.score(X.iloc[va], y.iloc[va]))
+
+    os.makedirs("ml/models", exist_ok=True)
+    out = os.path.join("ml","models","lin_up.joblib")
+    dump(pipe, out)
+    print("saved:", out)
+
+if __name__ == "__main__":
+    main()
+
+#cd C:\USERS\MU54B\DOCUMENTS\PYTHON\SCALPER
+#py -m scalper.ml.train_basic
