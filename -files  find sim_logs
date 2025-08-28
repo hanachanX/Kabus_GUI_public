@@ -1,0 +1,3 @@
+[33m9d92c19[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m chore: ignore sim_logs and stop tracking generated logs
+[33m1f01a05[m chore: ignore sim_logs and *.bak
+[33m95f5de2[m public: initial snapshot (Kabus_gui_v3.py + scalper)

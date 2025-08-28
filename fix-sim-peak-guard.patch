@@ -1,0 +1,18 @@
+diff --git a/Kabus_gui_v3.py b/Kabus_gui_v3.py
+--- a/Kabus_gui_v3.py
++++ b/Kabus_gui_v3.py
+@@
+-        self.special_quote = bool(sp)
++        # SIM?????PEAK?????????????????????????
++        self.special_quote = bool(sp) if self._is_real_trade_armed() else False
+         try:
+             self._log('DER', f'limits up={self.upper_limit} lo={self.lower_limit} spq={self.special_quote}')
+         except Exception:
+             pass
+@@
+-    if self.special_quote:
+-        self._log("SIM", "err: 'peak'")
+-        return
++    if self._is_real_trade_armed() and self.special_quote:
++        self._log("ORD", "block: SPECIAL QUOTE (PEAK)")
++        return
