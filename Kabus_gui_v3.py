@@ -190,7 +190,8 @@ class App(tk.Tk):
             except Exception:
                 under = 0.0
             sp = (bid is None or ask is None) or (over > 0 or under > 0)
-        self.special_quote = bool(sp)
+        # SIM中は旧来のPEAKチェックに引っかからないようにする（実弾のみ有効）
+        self.special_quote = bool(sp) if self._is_real_trade_armed() else False
         try:
             self._log('DER', f'limits up={self.upper_limit} lo={self.lower_limit} spq={self.special_quote}')
         except Exception:
