@@ -532,6 +532,29 @@ class App(tk.Tk):
         key = dedup_key or f"{tag}:{msg}"
         now = time.time()
         last = self._log_memo.get(key, 0.0)
+
+        '''# ---- trace SIM err origin (temporary) ----
+        import inspect, sys, threading
+        try:
+            if tag == "SIM" and isinstance(msg, str) and str(msg).strip().lower().startswith("err:"):
+                fr = inspect.stack()[1]
+                trace_line = f"[TRACE] log caller: {fr.filename}:{fr.lineno} in {fr.function}"
+                # UIに出す
+                def _trace_do():
+                    try:
+                        self.log_box.insert("end", trace_line + "\n")
+                        self.log_box.see("end")
+                    except Exception:
+                        print(trace_line, file=sys.stderr)
+                if threading.current_thread() is threading.main_thread():
+                    _trace_do()
+                else:
+                    self.ui_call(_trace_do)
+        except Exception as e:
+            print(f"[TRACE-error] {e}", file=sys.stderr)
+        '''
+
+
         if now - last < 5.0:
             return
         self._log_memo[key] = now
@@ -1937,10 +1960,20 @@ class App(tk.Tk):
                 self.lbl_misc.config(text=f"pushes={self.push_count}")
             except Exception:
                 pass
-            try:
-                self._sim_on_tick()
-            except Exception as e:
-                self._log("SIM", f"err: {e}")
++           try:
++               self._sim_on_tick()
++           except Exception as e:
++               # SIM中は例外で止めず、KeyError('peak') は警告に格下げして継続
++               name = type(e).__name__
++               text = str(e).strip().strip("'\"").lower()
++               if name == "KeyError" and text == "peak":
++                    self._log("SIM", "warn: missing field 'peak' (ignored)")
++               else:
++                   # 実弾ARM時だけ重めに扱う（SIMはwarnで継続）
++                   if getattr(self, "_is_real_trade_armed", None) and self._is_real_trade_armed():
++                       self._log("ORD", f"block-ish: SIM exception: {name}: {e}")
++                   else:
++                       self._log("SIM", f"warn: {name}: {e}")
             if self.auto_on.get():
                 try:
                     self._auto_loop()
@@ -3198,16 +3231,35 @@ class App(tk.Tk):
             self._sim_close(last, reason="SL")
             return
         # トレーリング
+
+
+        # トレーリング
         if self.use_trail.get():
-            p["peak"] = max(p["peak"], last) if side=="BUY" else min(p["peak"], last)
-            trigger = self.trail_trigger.get() * self.tick_size
-            gap     = self.trail_gap.get() * self.tick_size
-            if side=="BUY" and (p["peak"] - entry) >= trigger and (p["peak"] - last) >= gap:
-                self._sim_close(last, reason="TRAIL")
-                return
-            if side=="SELL" and (entry - p["peak"]) >= trigger and (last - p["peak"]) >= gap:
-                self._sim_close(last, reason="TRAIL")
-                return
+            # 初期化（pos['peak'] が無い/Noneでも動くように）
+            base_entry = float(p.get("entry", last))
+            peak = p.get("peak", None)
+            try:
+                peak = float(peak) if peak is not None else base_entry
+            except Exception:
+                peak = base_entry
+
+            # 直近価格で peak を更新
+            if side == "BUY":
+                peak = max(peak, last)
+            else:
+                peak = min(peak, last)
+            p["peak"] = peak  # 更新した値を保存
+
+            # 判定用パラメータ（数値化しておく）
+            trigger = float(self.trail_trigger.get()) * float(self.tick_size)
+            gap     = float(self.trail_gap.get())     * float(self.tick_size)
+
+            # クローズ条件
+            if side == "BUY"  and (peak - base_entry) >= trigger and (peak - last)  >= gap:
+                self._sim_close(last, reason="TRAIL"); return
+            if side == "SELL" and (base_entry - peak) >= trigger and (last - peak) >= gap:
+                self._sim_close(last, reason="TRAIL"); return
+
 
     def _sim_close(self, exit_price: float, reason="MANUAL"):
         """SIMポジションをクローズし、履歴に残す。必ず self.pos=None にする。"""
