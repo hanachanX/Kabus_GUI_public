@@ -1960,20 +1960,20 @@ class App(tk.Tk):
                 self.lbl_misc.config(text=f"pushes={self.push_count}")
             except Exception:
                 pass
-+           try:
-+               self._sim_on_tick()
-+           except Exception as e:
-+               # SIM中は例外で止めず、KeyError('peak') は警告に格下げして継続
-+               name = type(e).__name__
-+               text = str(e).strip().strip("'\"").lower()
-+               if name == "KeyError" and text == "peak":
-+                    self._log("SIM", "warn: missing field 'peak' (ignored)")
-+               else:
-+                   # 実弾ARM時だけ重めに扱う（SIMはwarnで継続）
-+                   if getattr(self, "_is_real_trade_armed", None) and self._is_real_trade_armed():
-+                       self._log("ORD", f"block-ish: SIM exception: {name}: {e}")
-+                   else:
-+                       self._log("SIM", f"warn: {name}: {e}")
+            try:
+                self._sim_on_tick()
+            except Exception as e:
+                 # SIM中は例外で止めず、KeyError('peak') は警告に格下げして継続
+                name = type(e).__name__
+                text = str(e).strip().strip("'\"").lower()
+                if name == "KeyError" and text == "peak":
+                    self._log("SIM", "warn: missing field 'peak' (ignored)")
+                else:
+                    # 実弾ARM時だけ重めに扱う（SIMはwarnで継続）
+                    if getattr(self, "_is_real_trade_armed", None) and self._is_real_trade_armed():
+                        self._log("ORD", f"block-ish: SIM exception: {name}: {e}")
+                    else:
+                        self._log("SIM", f"warn: {name}: {e}")
             if self.auto_on.get():
                 try:
                     self._auto_loop()
@@ -3360,6 +3360,31 @@ class App(tk.Tk):
         実弾条件を満たさない場合は即SIMルートへ。
         実弾条件（:18080 + real_trade ON + armed）が揃えば /sendorder を叩く。
         """
+            # ★ まず安全なスナップショットを作る（これを以後の“唯一の価格変数”にする）
+        px = price
+
+        try:
+            # 必要ならここで px を決める
+            if px is None:
+                # 例：成行っぽい振る舞いなら最良気配や最後値にフォールバック
+                if side == "BUY":
+                    px = self.best_ask if getattr(self, "best_ask", None) is not None else self.last_price
+                else:
+                    px = self.best_bid if getattr(self, "best_bid", None) is not None else self.last_price
+
+            # ここまでで px が決まらないなら明示的にエラー
+            if px is None:
+                raise ValueError("price is None (no quote available)")
+
+            # ……以降のロジックは **price ではなく常に px** を使う……
+            # body = {..., "price": float(px), ...}
+            # 実注文 / SIM 注文の送信処理など
+
+        except Exception as e:
+            tag = "AUTO" if is_auto else "ORD"
+            # ★ 例外ログは px だけを参照（price は触らない）
+            self._log(tag, f"send_entry_order error: {type(e).__name__}: {e}; px={px}")
+            return
             # === 追加ここから ===
         # ベース価格（price未指定なら Best を使用）
         if price is None:
