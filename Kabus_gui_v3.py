@@ -311,6 +311,8 @@ class App(tk.Tk):
         self.auto_enabled.trace_add("write", _sync_auto_cached)
         _sync_auto_cached()  # 初期値反映
 
+        
+
         # === ML 有効フラグも同様に（あれば） ===
         if not hasattr(self, "ml_enabled"):
             self.ml_enabled = tk.BooleanVar(value=False)
@@ -347,6 +349,12 @@ class App(tk.Tk):
         # ★ 手動決済／反転（今回追加）
         self.bind("<Control-e>",      lambda e: self._sim_close_market("MANUAL"))
         self.bind("<Control-Shift-e>",lambda e: self._sim_reverse())
+
+        # SIM履歴書き出し
+        #self.bind("<F9>", lambda e: self.export_sim_history_csv())
+        #self.bind("<F10>", lambda e: self.export_sim_history_xlsx())
+        #self.bind_all("<F9>",  lambda e: self.export_sim_history_csv())
+        #self.bind_all("<F10>", lambda e: self.export_sim_history_xlsx())
 
         # デバッグ
         self.debug_mode = tk.BooleanVar(value=False)
@@ -452,7 +460,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log("LOOP", "準備OK：①トークン → ②銘柄登録 → ③WS接続。まずはSIMで検証してください。")
 
-
+        self.after(1000, self._stats_heartbeat)
         # 主要UIバインディングの直後あたり（__init__ 内）
         self.upper_limit = None     # 値幅上限（ストップ高）
         self.lower_limit = None     # 値幅下限（ストップ安）
@@ -527,7 +535,7 @@ class App(tk.Tk):
     # --------- ログ ---------
     def _log(self, tag:str, msg:str, *, dedup_key:Optional[str]=None):
         """[HH:MM:SS] [TAG] message。5秒以内の同系ログは抑制。"""
-        ts = time.strftime("%H:%M:%S")
+        ts = self._nowstr_full()
         line = f"[{ts}] [{tag}] {msg}"
         key = dedup_key or f"{tag}:{msg}"
         now = time.time()
@@ -688,48 +696,301 @@ class App(tk.Tk):
         else:
             self._log("ORD", "キャンセル：SIMのみ動作を継続")
 
-    def _sim_close_market(self, reason="MANUAL", force=False):
-        """SIMポジションを成行相当でクローズ。
-        価格が取れない場合は HTTP スナップショットにフォールバック。
-        force=True のときは最終手段として “建値” で強制クローズ。
+    def _get_tree(self, mode="SIM"):
+        # 実際の変数名に合わせてここだけ調整
+        if mode == "LIVE":
+            return getattr(self, "tree_live", None) or getattr(self, "tree_live_hist", None) or getattr(self, "tree_live_history", None)
+        else:
+            return getattr(self, "tree_hist", None) or getattr(self, "tree_sim", None) or getattr(self, "tree_sim_history", None)
+
+    def _to_float(self, x, default=0.0):
+        try:
+            if x is None: return default
+            if isinstance(x, str):
+                x = x.strip().replace(",", "").replace("¥","")
+                if x in ("", "-", "—"): return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _rows_from_tree(self, mode="SIM"):
+        tv = self._get_tree(mode)
+        if tv is None:
+            return []
+        rows = []
+        for iid in tv.get_children(""):
+            v = tv.item(iid, "values")
+            rows.append({
+                "time":   v[0] if len(v)>0 else "",
+                "sym":    v[1] if len(v)>1 else "",
+                "side":   v[2] if len(v)>2 else "",
+                "qty":    self._to_float(v[3] if len(v)>3 else 0),
+                "entry":  self._to_float(v[4] if len(v)>4 else 0),
+                "exit":   self._to_float(v[5] if len(v)>5 else 0),
+                "ticks":  self._to_float(v[6] if len(v)>6 else 0),
+                "pnl":    self._to_float(v[7] if len(v)>7 else 0),
+                "reason": v[8] if len(v)>8 else "",
+            })
+        return rows
+
+
+
+    def _stats_heartbeat(self):
+        try:
+            self._update_stats_from_tree("SIM")
+            self._update_stats_from_tree("LIVE")
+        finally:
+            self.after(1000, self._stats_heartbeat)
+
+
+    def export_history_csv(self, mode="SIM"):
+        import csv, datetime as dt
+        from tkinter import filedialog, messagebox
+        try:
+            rows = self._rows_from_tree(mode)
+            if not rows:
+                messagebox.showinfo(f"{mode}履歴", "出力できるデータがありません。"); return
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV","*.csv")],
+                initialfile=f"{mode.lower()}_trades_{ts}.csv",
+                title=f"{mode}履歴の保存先を選択"
+            )
+            if not path: return
+            cols = ["time","sym","side","qty","entry","exit","ticks","pnl","reason"]
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+                for r in rows: w.writerow({k: r.get(k,"") for k in cols})
+            self._log(mode, f"CSV保存: {path}")
+        except Exception as e:
+            self._log("ERR", f"export_history_csv({mode}): {e}")
+
+    def export_history_xlsx(self, mode="SIM"):
+        import datetime as dt
+        from tkinter import filedialog, messagebox
+        try:
+            import pandas as pd
+        except Exception:
+            messagebox.showwarning("依存ライブラリ", "pandas がありません。pip install pandas"); return
+        try:
+            rows = self._rows_from_tree(mode)
+            if not rows:
+                messagebox.showinfo(f"{mode}履歴", "出力できるデータがありません。"); return
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel","*.xlsx")],
+                initialfile=f"{mode.lower()}_trades_{ts}.xlsx",
+                title=f"{mode}履歴の保存先を選択"
+            )
+            if not path: return
+            pd.DataFrame(rows, columns=["time","sym","side","qty","entry","exit","ticks","pnl","reason"]).to_excel(path, index=False)
+            self._log(mode, f"XLSX保存: {path}")
+        except Exception as e:
+            self._log("ERR", f"export_history_xlsx({mode}): {e}")
+
+    def export_sim_history_csv(self):
+        import csv, datetime as dt
+        from tkinter import filedialog, messagebox
+        try:
+            rows = self._sim_rows_from_tree()
+            if not rows:
+                messagebox.showinfo("SIM履歴", "出力できるデータがありません。"); return
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV","*.csv")],
+                initialfile=f"sim_trades_{ts}.csv",
+                title="SIM履歴の保存先を選択"
+            )
+            if not path: return
+            cols = ["time","sym","side","qty","entry","exit","ticks","pnl","reason"]
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+                for r in rows: w.writerow({k: r.get(k,"") for k in cols})
+            self._log("SIM", f"CSV保存: {path}")
+        except Exception as e:
+            self._log("ERR", f"export_sim_history_csv: {e}")
+
+    def export_sim_history_xlsx(self):
+        import datetime as dt
+        from tkinter import filedialog, messagebox
+        try:
+            import pandas as pd
+        except Exception:
+            messagebox.showwarning("依存ライブラリ", "pandas がありません。pip install pandas"); return
+        try:
+            rows = self._sim_rows_from_tree()
+            if not rows:
+                messagebox.showinfo("SIM履歴", "出力できるデータがありません。"); return
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel","*.xlsx")],
+                initialfile=f"sim_trades_{ts}.xlsx",
+                title="SIM履歴の保存先を選択"
+            )
+            if not path: return
+            pd.DataFrame(rows, columns=["time","sym","side","qty","entry","exit","ticks","pnl","reason"]).to_excel(path, index=False)
+            self._log("SIM", f"XLSX保存: {path}")
+        except Exception as e:
+            self._log("ERR", f"export_sim_history_xlsx: {e}")
+
+
+    # ----- タイムスタンプ -----
+    def _nowstr_full(self):
+        import datetime as dt
+        return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+    # --- ツリーからSIM行を読む共通関数（クラス内に追加/維持） ---
+    def _get_sim_tree(self):
+        if hasattr(self, "tree_hist") and self.tree_hist is not None:
+            return self.tree_hist
+        if hasattr(self, "tree_sim") and self.tree_sim is not None:
+            return self.tree_sim
+        return None
+
+    def _sim_rows_from_tree(self):
+        tv = self._get_sim_tree()
+        if tv is None:
+            return []
+        rows = []
+        for iid in tv.get_children(""):
+            v = tv.item(iid, "values")
+            rows.append({
+                "time":   v[0] if len(v)>0 else "",
+                "sym":    v[1] if len(v)>1 else "",
+                "side":   v[2] if len(v)>2 else "",
+                "qty":    self._to_float(v[3] if len(v)>3 else 0),
+                "entry":  self._to_float(v[4] if len(v)>4 else 0),
+                "exit":   self._to_float(v[5] if len(v)>5 else 0),
+                "ticks":  self._to_float(v[6] if len(v)>6 else 0),
+                "pnl":    self._to_float(v[7] if len(v)>7 else 0),
+                "reason": v[8] if len(v)>8 else "",
+            })
+        return rows
+
+    def _update_stats_from_tree(self, mode="SIM"):
+        rows = self._rows_from_tree(mode)
+        ex = [r for r in rows if isinstance(r["reason"], str) and ("EXIT" in r["reason"])]
+        n = len(ex)
+        wins = sum(1 for r in ex if r["ticks"] > 0 or r["pnl"] > 0)
+        ticks_sum = sum(r["ticks"] for r in ex)
+        pnl_sum   = sum(r["pnl"]   for r in ex)
+        wr  = (wins / n * 100.0) if n else 0.0
+        avg = (ticks_sum / n) if n else 0.0
+        text = f"Trades: {n} | Win: {wins} ({wr:.1f}%) | P&L: ¥{int(pnl_sum):,} | Avg: {avg:.2f}t"
+
+        if mode == "LIVE" and hasattr(self, "var_livestats"):
+            self.var_livestats.set(text)
+        if mode == "SIM"  and hasattr(self, "var_simstats"):
+            self.var_simstats.set(text)
+
+
+    def _update_sim_stats_from_tree(self):
+        rows = self._sim_rows_from_tree()
+        # ★ EXIT行のみ集計（ENTERは除外）
+        ex = [r for r in rows if isinstance(r["reason"], str) and ("EXIT" in r["reason"])]
+        n = len(ex)
+        wins = sum(1 for r in ex if r["ticks"] > 0 or r["pnl"] > 0)
+        ticks_sum = sum(r["ticks"] for r in ex)
+        pnl_sum   = sum(r["pnl"]   for r in ex)
+        wr  = (wins / n * 100.0) if n else 0.0
+        avg = (ticks_sum / n) if n else 0.0
+        text = f"Trades: {n} | Win: {wins} ({wr:.1f}%) | P&L: ¥{int(pnl_sum):,} | Avg: {avg:.2f}t"
+
+        if hasattr(self, "var_simstats"):
+            self.var_simstats.set(text)   # ★ lbl_stats ではなくこちらだけ
+
+    def _stats_heartbeat(self):
+        # 取りこぼし防止。1秒周期でツリーから再集計
+        try:
+            self._update_sim_stats_from_tree()
+        finally:
+            self.after(1000, self._stats_heartbeat)
+
+
+    def _sim_close_market(self, reason: str = "MANUAL", force: bool = False):
+        """SIMポジションを成行相当でクローズする。
+        価格取得の優先度:
+        1) BUY→Bid / SELL→Ask
+        2) last_price
+        3) HTTPスナップショット後に 1)→2) 再評価
+        4) force=True のときは建値(entry)で強制クローズ
+        いずれでも価格が取れなければ何もしない。
         """
         p = getattr(self, "pos", None)
-        if not p:
+        if not p or int(p.get("qty", 0)) <= 0:
             self._log("SIM", "close: no position")
             return
 
-        side = p.get("side")
-        px = None
+        side  = str(p.get("side", "")).upper()   # "BUY" or "SELL"
+        entry = float(p.get("entry", 0.0))
 
-        # 1) 通常の決済価格（BUY→Bid / SELL→Ask → last）
-        try:
-            px = (self.best_bid if side == "BUY" else self.best_ask) or self.last_price
-        except Exception:
-            px = None
+        # 価格を選ぶローカル関数
+        def _pick_px():
+            try:
+                bid  = getattr(self, "best_bid", None)
+                ask  = getattr(self, "best_ask", None)
+                last = getattr(self, "last_price", None)
+                ref = bid if side == "BUY" else ask
+                return ref if ref not in (None, 0) else last
+            except Exception:
+                return None
 
-        # 2) 取れなければスナップショットで更新
+        # 1) まずは板/lastから
+        px = _pick_px()
+
+        # 2) 無ければスナップショットを一度だけ試す
         if px is None:
             try:
-                self._snapshot_symbol_once()  # UIは触らない実装
-                px = (self.best_bid if side == "BUY" else self.best_ask) or self.last_price
-            except Exception:
-                px = None
+                self._snapshot_symbol_once()  # UIには触らない想定
+            except Exception as e:
+                self._log("SIM", f"snapshot failed: {e}")
+            px = _pick_px()
 
-        # 3) 強制クローズ（建値）オプション
+        # 3) なお無ければ force で建値クローズ
         if px is None and force:
-            px = p.get("entry")
+            px = entry
 
         if px is None:
-            self._log("SIM", "close skipped: price unavailable（引け後・無更新の可能性）")
-            # 画面はポジションが残る（未決済）ので表示は維持
+            self._log("SIM", "close skipped: price unavailable（引け後/無更新の可能性）")
             return
 
+        # 数値として妥当かチェック
         try:
-            self._sim_close(float(px), reason=reason)
+            px = float(px)
+            if not (px > 0 and px == px):  # NaN も弾く
+                raise ValueError(f"bad price {px}")
+        except Exception as e:
+            self._log("SIM", f"close skipped: invalid price ({e})")
+            return
+
+        # 実際の決済ロジック（履歴追加・集計更新は _sim_close 側で行う想定）
+        try:
+            self._sim_close(px, reason=reason)
         except Exception as e:
             self._log_exc("SIM", e)
-        # 表示更新（非同期でUIスレッドへ）
-        self.ui_call(self._update_simpos)
+
+        # 画面更新（UIスレッド経由があればそれを使う）
+        try:
+            if hasattr(self, "ui_call") and callable(getattr(self, "ui_call")):
+                self.ui_call(self._update_simpos)
+                if hasattr(self, "_update_sim_stats_label"):
+                    self.ui_call(self._update_sim_stats_label)
+                if hasattr(self, "_update_sim_summary"):
+                    self.ui_call(self._update_sim_summary)
+            else:
+                self._update_simpos()
+                if hasattr(self, "_update_sim_stats_label"):
+                    self._update_sim_stats_label()
+                if hasattr(self, "_update_sim_summary"):
+                    self._update_sim_summary()
+        except Exception as e:
+            self._log("SIM", f"ui update skipped: {e}")
+
 
 
         def _sim_reverse(self):
@@ -742,6 +1003,35 @@ class App(tk.Tk):
             opp = "SELL" if cur_side == "BUY" else "BUY"
             self._sim_open(opp)
             self._log("SIM", f"reverse -> {opp}")
+
+    # ----- SIM履歴 -----
+
+    def _build_history_panel(self, parent):
+        import tkinter as tk
+        from tkinter import ttk
+
+        # パネル用のフレーム（gridで伸縮）
+        self.hist_frame = ttk.Frame(parent)
+        self.hist_frame.grid_columnconfigure(0, weight=1)
+        self.hist_frame.grid_rowconfigure(0, weight=1)
+
+        # Treeview 本体
+        cols = ("ts","symbol","side","qty","entry","exit","ticks","pnl","reason")
+        self.tree_hist = ttk.Treeview(self.hist_frame, columns=cols, show="headings", height=12)
+        for c, w in zip(cols, (90,80,60,60,80,80,70,90,120)):
+            self.tree_hist.heading(c, text=c)
+            self.tree_hist.column(c, width=w, anchor="center" if c in ("side","qty","ticks") else "e" if c in ("entry","exit","pnl") else "w")
+
+        # 縦スクロールバー（同じ親に置く）
+        vsb = ttk.Scrollbar(self.hist_frame, orient="vertical", command=self.tree_hist.yview)
+        self.tree_hist.configure(yscrollcommand=vsb.set)
+
+        # レイアウト
+        self.tree_hist.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        return self.hist_frame
+
 
 
 
@@ -968,13 +1258,20 @@ class App(tk.Tk):
         self.lbl_inds = ttk.Label(self.summary_bot, text="VWAP:—  SMA25:—  MACD:—/—  RSI:—", anchor="w")
         self.lbl_inds.grid(row=0, column=1, sticky="we", padx=10)
 
-        # 右：SIM建玉と成績（縦配置）
-        self.lbl_simpos = ttk.Label(self.summary_bot, text="SIM: —")
-        self.lbl_simpos.grid(row=0, column=2, sticky="e")
-        self.lbl_stats  = ttk.Label(self.summary_bot, text="Trades: 0 | Win: 0 (0.0%) | P&L: ¥0 | Avg: 0.00t")
-        self.lbl_stats.grid(row=1, column=2, sticky="e")
+                # 右：LIVE建玉と成績（縦）
+        self.lbl_livepos    = ttk.Label(self.summary_bot, text="LIVE: —")
+        self.lbl_livepos.grid(row=0, column=2, sticky="e")
+        self.var_livestats  = tk.StringVar(value="Trades: 0 | Win: 0 (0.0%) | P&L: ¥0 | Avg: 0.00t")
+        self.lbl_live_stats = ttk.Label(self.summary_bot, textvariable=self.var_livestats)
+        self.lbl_live_stats.grid(row=1, column=2, sticky="e")
 
-        # Notebook（配置は _layout で）
+        # 右：SIM建玉と成績（縦）
+        self.lbl_simpos     = ttk.Label(self.summary_bot, text="SIM: —")
+        self.lbl_simpos.grid(row=2, column=2, sticky="e")
+        self.var_simstats   = tk.StringVar(value="Trades: 0 | Win: 0 (0.0%) | P&L: ¥0 | Avg: 0.00t")
+        self.lbl_sim_stats  = ttk.Label(self.summary_bot, textvariable=self.var_simstats)
+        self.lbl_sim_stats.grid(row=3, column=2, sticky="e")
+                # Notebook（配置は _layout で）
         self.main_nb = ttk.Notebook(self.root)
 
         # 板・歩み値
@@ -1078,20 +1375,53 @@ class App(tk.Tk):
 
         # SIM履歴
         self.tab_hist = ttk.Frame(self.main_nb)
-        bth = ttk.Frame(self.tab_hist); bth.pack(fill="x", pady=(6,2))
-        ttk.Button(bth, text="CSV保存",  command=self.save_hist_csv).pack(side="left", padx=(6,0))
-        ttk.Button(bth, text="XLSX保存", command=self.save_hist_xlsx).pack(side="left", padx=6)
-        self.tree_hist = ttk.Treeview(self.tab_hist, columns=("time","sym","side","qty","entry","exit","ticks","pnl","reason"), show="headings", height=16)
-        for c,t,w in (("time","時刻",160),("sym","銘柄",90),("side","売買",60),("qty","数量",80),("entry","建値",90),("exit","決済",90),("ticks","tick",70),("pnl","損益(円)",100),("reason","理由",120)):
-            self.tree_hist.heading(c, text=t); self.tree_hist.column(c, width=w, anchor="e" if c in ("qty","entry","exit","ticks","pnl") else "w")
-        self.tree_hist.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # 上部：ボタンバー
+        bth = ttk.Frame(self.tab_hist)
+        bth.pack(fill="x", pady=(6,2))
+        ttk.Button(bth, text="CSV保存 (F9)",
+           command=lambda: self.export_history_csv("SIM")).pack(side="left", padx=6)
+        ttk.Button(bth, text="XLSX保存 (F10)",
+           command=lambda: self.export_history_xlsx("SIM")).pack(side="left", padx=6)
+
+        # 中央：Treeview + 縦スクロール（同じ親フレームに入れるのがポイント）
+        wrap = ttk.Frame(self.tab_hist)
+        wrap.pack(fill="both", expand=True, padx=6, pady=6)
+
+        cols = ("time","sym","side","qty","entry","exit","ticks","pnl","reason")
+        self.tree_hist = ttk.Treeview(wrap, columns=cols, show="headings", height=16)
+        for c, t, w in (
+            ("time","時刻",160),("sym","銘柄",90),("side","売買",60),("qty","数量",80),
+            ("entry","建値",90),("exit","決済",90),("ticks","tick",70),("pnl","損益(円)",100),
+            ("reason","理由",120),
+        ):
+            self.tree_hist.heading(c, text=t)
+            self.tree_hist.column(c, width=w, anchor=("e" if c in ("qty","entry","exit","ticks","pnl") else "w"))
+
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree_hist.yview)
+        self.tree_hist.configure(yscrollcommand=vsb.set)
+        self.tree_hist.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        # 初期化＆ラベル
+        self._ensure_sim_history()
+        self._update_sim_labels()
+
+        # Notebook にタブ追加
+        self.main_nb.add(self.tab_hist, text="SIM履歴")
+
+        # ショートカット（任意）
+        self.bind_all("<F9>",  lambda e: self.export_sim_history_csv())
+        self.bind_all("<F10>", lambda e: self.export_sim_history_xlsx())
 
         # LIVE履歴
         self.tab_live = ttk.Frame(self.main_nb)
         btl = ttk.Frame(self.tab_live); btl.pack(fill="x", pady=(6,2))
         ttk.Button(btl, text="LIVE更新（/orders取得）", command=lambda: threading.Thread(target=self.update_live_history, daemon=True).start()).pack(side="left", padx=(6,0))
-        ttk.Button(btl, text="CSV保存",  command=self.save_live_csv).pack(side="left", padx=6)
-        ttk.Button(btl, text="XLSX保存", command=self.save_live_xlsx).pack(side="left", padx=6)
+        ttk.Button(btl, text="CSV保存",
+           command=lambda: self.export_history_csv("LIVE")).pack(side="left", padx=6)
+        ttk.Button(btl, text="XLSX保存",
+           command=lambda: self.export_history_xlsx("LIVE")).pack(side="left", padx=6)
         self.tree_live = ttk.Treeview(self.tab_live, columns=("time","id","sym","name","side","qty","price","status"), show="headings", height=16)
         for c,t,w in (("time","時刻",160),("id","注文ID",180),("sym","コード",80),("name","銘柄名",160),("side","売買",60),("qty","数量",80),("price","価格",90),("status","状態",160)):
             self.tree_live.heading(c, text=t); self.tree_live.column(c, width=w, anchor="e" if c in ("qty","price") else "w")
@@ -1130,6 +1460,8 @@ class App(tk.Tk):
         self.main_nb.add(self.tab_live, text="LIVE履歴")
         self.main_nb.add(self.tab_scan, text="スクリーニング")
 
+        #self._build_sim_hist_ui(self.tab_hist)
+
         # ログ（横幅拡張 + 水平スクロール追加）※ 配置は _layout で
         self.logf = ttk.LabelFrame(self.root, text="ログ（送受信・イベント・エラー）", padding=6)
         self.trainbar = ttk.Frame(self.logf); self.trainbar.pack(fill="x", padx=6, pady=(0,6))
@@ -1148,6 +1480,8 @@ class App(tk.Tk):
             self._log("CFG", "右クリックメニュー準備OK（Ctrl+Shift+T で調整ウィンドウ）")
         except Exception as e:
             self._log("CFG", f"右クリックメニュー初期化失敗: {e}")
+        i_live = self.main_nb.index(self.tab_live)
+        self.main_nb.insert(i_live, self.tab_hist)
             
     def _layout(self):
         # root 直下は grid 統一（pack混在禁止）
@@ -1227,6 +1561,82 @@ class App(tk.Tk):
     def _on_ml_toggle(self):
         self.ml_gate.cfg.enabled = bool(self.ml_enabled.get())
         self._log("ML", f"Enabled={self.ml_gate.cfg.enabled}")
+
+    def _ensure_sim_history(self):
+        if not hasattr(self, "sim_history") or not isinstance(self.sim_history, list):
+            self.sim_history = []
+        if not hasattr(self, "sim_stats") or not isinstance(self.sim_stats, dict):
+            self.sim_stats = {}
+        self.sim_stats.setdefault("trades", 0)
+        self.sim_stats.setdefault("wins",   0)
+        self.sim_stats.setdefault("pnl",    0.0)
+
+    def _update_sim_labels(self):
+        self._ensure_sim_history()
+        n    = int(self.sim_stats.get("trades", 0) or 0)
+        pnl  = float(self.sim_stats.get("pnl", 0.0) or 0.0)
+        wins = int(self.sim_stats.get("wins", 0) or 0)
+        wr   = (wins / n * 100.0) if n > 0 else 0.0
+        txt  = f"SIM: trades={n}  PnL=¥{int(pnl):,}  WR={wr:.1f}%"
+        try:
+            (self.lbl_stats or self.lbl_misc).config(text=txt)  # どちらかある方に表示
+        except Exception:
+            pass
+
+
+
+    # ----- SIM履歴書き出し -----
+
+    # --- CSV / XLSX 出力（古い呼び先を使わない版に置き換え） ---
+    def export_sim_history_csv(self):
+        import csv, datetime as dt
+        from tkinter import filedialog, messagebox
+        try:
+            rows = self._sim_rows_from_tree()   # ←ここ重要
+            if not rows:
+                messagebox.showinfo("SIM履歴", "出力できるデータがありません。"); return
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV","*.csv")],
+                initialfile=f"sim_trades_{ts}.csv",
+                title="SIM履歴の保存先を選択"
+            )
+            if not path: return
+            cols = ["time","sym","side","qty","entry","exit","ticks","pnl","reason"]
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+                for r in rows: w.writerow({k: r.get(k,"") for k in cols})
+            self._log("SIM", f"CSV保存: {path}")
+        except Exception as e:
+            self._log("ERR", f"export_sim_history_csv: {e}")
+
+    def export_sim_history_xlsx(self):
+        import datetime as dt
+        from tkinter import filedialog, messagebox
+        try:
+            import pandas as pd
+        except Exception:
+            messagebox.showwarning("依存ライブラリ", "pandas がありません。pip install pandas"); return
+        try:
+            rows = self._sim_rows_from_tree()   # ←ここ重要
+            if not rows:
+                messagebox.showinfo("SIM履歴", "出力できるデータがありません。"); return
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel","*.xlsx")],
+                initialfile=f"sim_trades_{ts}.xlsx",
+                title="SIM履歴の保存先を選択"
+            )
+            if not path: return
+            import pandas as pd
+            pd.DataFrame(rows, columns=["time","sym","side","qty","entry","exit","ticks","pnl","reason"]).to_excel(path, index=False)
+            self._log("SIM", f"XLSX保存: {path}")
+        except Exception as e:
+            self._log("ERR", f"export_sim_history_xlsx: {e}")
+
+
 
     # ==============================
     # REST
@@ -1659,6 +2069,83 @@ class App(tk.Tk):
             self.ui_call(_ui)
         except Exception as e:
             self._log("DER", f"recalc error: {e}")
+
+    def _update_sim_stats_label(self):
+        s = self.sim_stats
+        # デバッグ: 欠損や型崩れを検知
+        for k in ("trades","wins","ticks_sum","pnl_yen"):
+            if k not in s:
+                self._log("ERR", f"sim_stats missing key: {k}")
+                s.setdefault(k, 0 if k in ("trades","wins") else 0.0)
+            # 文字列→数値の安全変換
+            if isinstance(s[k], str):
+                s[k] = s[k].strip().replace(",", "").replace("¥","") or "0"
+                s[k] = float(s[k]) if k in ("ticks_sum","pnl_yen") else int(float(s[k]))
+
+        t = int(s["trades"]); w = int(s["wins"])
+        wr  = (w / t * 100.0) if t > 0 else 0.0
+        avg = (float(s["ticks_sum"]) / t) if t > 0 else 0.0
+        pnl = int(float(s["pnl_yen"]))
+        # ★ lbl_stats を SIM用に使っているならそのまま。別ラベルなら置き換えてください。
+        self.lbl_stats.config(text=f"Trades: {t} | Win: {w} ({wr:.1f}%) | P&L: ¥{pnl:,} | Avg: {avg:.2f}t")
+
+    def _record_sim_trade(self, *, ticks=None, pnl_yen=None):
+        """約定/決済が確定したタイミングで呼ぶ。ticks or pnl_yen のどちらかが無くてもOK。"""
+        # 文字列を食べても安全な変換
+        def _to_float(x):
+            if x is None: return 0.0
+            if isinstance(x, str):
+                x = x.strip().replace(",", "").replace("¥","")
+                if x in ("", "-", "—"): return 0.0
+            try:
+                return float(x)
+            except Exception:
+                return 0.0
+
+        t = _to_float(ticks)
+        p = _to_float(pnl_yen)
+
+        self.sim_stats["trades"]   += 1
+        self.sim_stats["ticks_sum"] += t
+        self.sim_stats["pnl_yen"]  += p
+
+        # 勝ち判定は ticks>0 または pnl>0 のどちらかでOK
+        if t > 0.0 or p > 0.0:
+            self.sim_stats["wins"] += 1
+
+        self._update_sim_stats_label()
+
+    def _recalc_sim_stats_from_tree(self):
+        tv = getattr(self, "tree_hist", None)
+        if tv is None:
+            return
+        trades = wins = 0
+        ticks_sum = pnl_sum = 0.0
+
+        def _to_float(x):
+            if x is None: return 0.0
+            if isinstance(x, str):
+                x = x.strip().replace(",", "").replace("¥","")
+                if x in ("", "-", "—"): return 0.0
+            try:
+                return float(x)
+            except Exception:
+                return 0.0
+
+        for iid in tv.get_children(""):
+            vals = tv.item(iid, "values")
+            # columns: time, sym, side, qty, entry, exit, ticks, pnl, reason
+            t = _to_float(vals[6] if len(vals) > 6 else 0)
+            p = _to_float(vals[7] if len(vals) > 7 else 0)
+            trades += 1
+            ticks_sum += t
+            pnl_sum += p
+            if t > 0.0 or p > 0.0:
+                wins += 1
+
+        self.sim_stats.update({"trades": trades, "wins": wins, "ticks_sum": ticks_sum, "pnl_yen": pnl_sum})
+        self._update_sim_stats_label()
+
 
 
     def _simpos_text(self) -> str:
@@ -2468,38 +2955,62 @@ class App(tk.Tk):
         return 100.0 - (100.0/(1.0+rs))
 
     def _update_summary(self):
-        code=self.symbol.get().strip(); name=self._resolve_symbol_name(code) or ""
+        # ① コード正規化＆名前のフォールバック
+        try:
+            code_raw = (self.symbol.get() or "").strip()
+        except Exception:
+            code_raw = (getattr(self, "current_symbol", "") or "").strip()
+        # 8136.T → 8136 など4桁を優先（必要なければこの2行は削ってOK）
+        import re
+        m = re.search(r"\b(\d{4})\b", code_raw)
+        code = m.group(1) if m else code_raw
+
+        name = (self._resolve_symbol_name(code) or
+                (getattr(self, "last_snapshot", {}) or {}).get("SymbolName", "") or
+                (getattr(self, "last_quote",   {}) or {}).get("SymbolName", ""))
+
+        # ② 価格・前日比
         if self.last_price is None:
             self.lbl_price.config(text=f"{code} {name} —", fg="black")
             self.lbl_change.config(text=" — ", fg="black")
         else:
-            txt=f"{code} {name} {self.last_price:,.1f}"
+            txt = f"{code} {name} {self.last_price:,.1f}"
             if self.prev_close:
-                diff=self.last_price-self.prev_close; pct=diff/self.prev_close*100.0
-                col="green" if diff>=0 else "red"
+                diff = self.last_price - self.prev_close
+                pct  = diff / self.prev_close * 100.0
+                col  = "green" if diff >= 0 else "red"
                 self.lbl_price.config(text=txt, fg="black")
                 self.lbl_change.config(text=f"{diff:+.1f} ({pct:+.2f}%)", fg=col)
             else:
-                self.lbl_price.config(text=txt, fg="black"); self.lbl_change.config(text=" — ", fg="black")
+                self.lbl_price.config(text=txt, fg="black")
+                self.lbl_change.config(text=" — ", fg="black")
 
-        t=self.sim_stats['trades']; w=self.sim_stats['wins']
-        wr=(w/t*100.0) if t>0 else 0.0
-        avg=(self.sim_stats['ticks_sum']/t) if t>0 else 0.0
-        pnl=int(self.sim_stats['pnl_yen'])
-        self.lbl_stats.config(text=f"Trades: {t} | Win: {w} ({wr:.1f}%) | P&L: ¥{pnl:,} | Avg: {avg:.2f}t")
+        # ③ SIM成績ラベルは“専用ラベル”があれば上書きしない
+        if hasattr(self, "var_simstats") or hasattr(self, "lbl_sim_stats"):
+            pass  # 成績は _update_stats_from_tree("SIM") 側で更新する
+        else:
+            # 旧実装のまま使う場合だけ従来計算
+            t = self.sim_stats.get('trades', 0); w = self.sim_stats.get('wins', 0)
+            wr  = (w / t * 100.0) if t > 0 else 0.0
+            avg = (self.sim_stats.get('ticks_sum', 0.0) / t) if t > 0 else 0.0
+            pnl = int(self.sim_stats.get('pnl_yen', 0.0))
+            self.lbl_stats.config(text=f"Trades: {t} | Win: {w} ({wr:.1f}%) | P&L: ¥{pnl:,} | Avg: {avg:.2f}t")
 
-        sma = "—" if self.sma25 is None else f"{self.sma25:.1f}"
+        # ④ インジ表示
+        sma  = "—" if self.sma25 is None else f"{self.sma25:.1f}"
         macd = "—/—" if self.macd is None or self.macd_sig is None else f"{self.macd:+.2f}/{self.macd_sig:+.2f}"
-        rsi = "—" if self.rsi is None else f"{self.rsi:.1f}"
+        rsi  = "—" if self.rsi  is None else f"{self.rsi:.1f}"
         vwap = "—" if self.vwap is None else f"{self.vwap:.1f}"
         self.lbl_inds.config(text=f"VWAP:{vwap} SMA25:{sma} MACD:{macd} RSI:{rsi}")
+
+        # ⑤ そのほか既存更新
         self._update_simpos()
         self._update_price_bar()
         self._update_simpos_summary()
 
 
     def _append_tape(self, price, size, direction):
-        ts=time.strftime("%H:%M:%S")
+        ts=self._nowstr_full()
         mark = "▲" if direction=="UP" else ("▼" if direction=="DOWN" else "・")
         text = f"{ts} {price:,.1f} x{size} {mark}\n"
         tag  = "up" if direction=="UP" else ("down" if direction=="DOWN" else "flat")
@@ -2560,6 +3071,173 @@ class App(tk.Tk):
                 self.tree_bid.insert("", "end", values=(f"{float(p):.1f}", f"{int(q)}"))
         except Exception:
             pass
+
+    '''
+    def _build_sim_hist_ui(self, parent):
+        import tkinter as tk
+        from tkinter import ttk
+
+        # 中身用のフレームをタブに pack（タブ側の他ウィジェットと混ざらない）
+        hist_frame = ttk.Frame(parent)
+        hist_frame.pack(fill="both", expand=True)
+
+        # フレーム内部は grid でTree+Scrollbarを並べる
+        hist_frame.grid_columnconfigure(0, weight=1)
+        hist_frame.grid_rowconfigure(0, weight=1)
+
+        # Treeview 本体（列は必要に合わせて調整）
+        cols = ("ts","symbol","side","qty","entry","exit","ticks","pnl","reason")
+        self.tree_hist = ttk.Treeview(hist_frame, columns=cols, show="headings", height=12)
+        for c, w in zip(cols, (90,80,60,60,80,80,70,90,140)):
+            self.tree_hist.heading(c, text=c)
+            anchor = "center" if c in ("side","qty","ticks") else ("e" if c in ("entry","exit","pnl") else "w")
+            self.tree_hist.column(c, width=w, anchor=anchor)
+
+        # 縦スクロールバー（同じ親に置くのがポイント）
+        vsb = ttk.Scrollbar(hist_frame, orient="vertical", command=self.tree_hist.yview)
+        self.tree_hist.configure(yscrollcommand=vsb.set)
+
+        # 配置
+        self.tree_hist.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        # 下部のボタンバー
+        bth = ttk.Frame(hist_frame)
+        bth.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        try:
+            # 既存の関数名に合わせてください（export_sim_history_csv/xlsx）
+            self.btn_export_csv  = ttk.Button(bth, text="CSV保存 (F9)",  command=lambda: self.export_sim_history_csv())
+            self.btn_export_xlsx = ttk.Button(bth, text="XLSX保存 (F10)", command=lambda: self.export_sim_history_xlsx())
+            self.btn_export_csv.pack(side="left", padx=(6,0))
+            self.btn_export_xlsx.pack(side="left", padx=(6,0))
+        except Exception as e:
+            self._log("SIM", f"export buttons init error: {e}")
+
+        # 初期の統計表示（未初期化でも落ちないように）
+        self._ensure_sim_history()     # ← これが無いと起動直後 KeyError になります
+        self._update_sim_labels()
+
+        # ショートカット（タブ内どこでも効かせたいなら bind_all）
+        self.bind_all("<F9>",  lambda e: self.export_sim_history_csv())
+        self.bind_all("<F10>", lambda e: self.export_sim_history_xlsx())
+
+
+        '''
+
+    # -----　表示関連 -----
+    def _normalize_sym(self, s: str) -> str:
+        import re
+        s = (s or "").strip()
+        m = re.search(r"\b(\d{4})\b", s)  # 8136.T → 8136 など
+        return m.group(1) if m else s
+
+    def _get_current_symbol(self) -> str:
+        try:
+            return (self.symbol.get() or "").strip()
+        except Exception:
+            return (getattr(self, "current_symbol", "") or "").strip()
+
+    def _get_symbol_name(self, sym: str) -> str:
+        # ① 既存リゾルバ
+        try:
+            if hasattr(self, "_resolve_symbol_name"):
+                name = self._resolve_symbol_name(sym) or ""
+                if name: return name
+        except Exception:
+            pass
+        # ② 直近スナップショット/板のフォールバック
+        snap = getattr(self, "last_snapshot", {}) or {}
+        quote = getattr(self, "last_quote", {}) or {}
+        return snap.get("SymbolName") or quote.get("SymbolName") or ""
+
+    def _update_summary_title(self):
+        try:
+            sym_raw = self._get_current_symbol()
+            sym = self._normalize_sym(sym_raw)
+            name = self._get_symbol_name(sym)
+            px = getattr(self, "last_price", None)
+            text = f"{sym} {name} {px:,.1f}" if px is not None else f"{sym} {name}"
+            # あなたのラベル/変数名に合わせて自動で更新
+            if hasattr(self, "var_title"):    self.var_title.set(text.strip())
+            elif hasattr(self, "lbl_title"):  self.lbl_title.config(text=text.strip())
+            elif hasattr(self, "lbl_symbol"): self.lbl_symbol.config(text=text.strip())
+        except Exception as e:
+            try: self._log("UI", f"_update_summary_title: {e}")
+            except Exception: pass
+
+
+
+    # --- SIM履歴/統計ユーティリティ ---
+    def _ensure_sim_history(self):
+        if not hasattr(self, "sim_history"):
+            self.sim_history = []   # list[dict]
+        if not hasattr(self, "sim_stats"):
+            self.sim_stats = {"trades": 0, "wins": 0, "pnl": 0.0}
+
+    def _append_history(self, mode, *, ts, symbol, side, qty, entry, exit=None, ticks=0.0, pnl=0.0, reason=""):
+        tv = self._get_tree(mode)
+        if tv is None:
+            self._log("ERR", f"{mode} tree not found"); return
+        vals = (ts, symbol, side, qty, entry, ("" if exit is None else exit), ticks, pnl, reason)
+        try:
+            tv.insert("", "end", values=vals)
+        except Exception as e:
+            self._log("ERR", f"append_history({mode}): {e}")
+            return
+        # 追加したらその場で集計
+        try:
+            self._update_stats_from_tree(mode)
+        except Exception as e:
+            self._log("ERR", f"update_stats({mode}): {e}")
+
+    # 既存の SIM 用ヘルパがあるならこうして内側で呼ぶ：
+    def _append_sim_history(self, **kw):
+        self._append_history("SIM", **kw)
+
+    # LIVE 用（必要なら）
+    def _append_live_history(self, **kw):
+        self._append_history("LIVE", **kw)
+
+
+    def _update_sim_labels(self):
+        self._ensure_sim_history()
+        n    = int(self.sim_stats.get("trades", 0) or 0)
+        pnl  = float(self.sim_stats.get("pnl", 0.0) or 0.0)
+        wins = int(self.sim_stats.get("wins", 0) or 0)
+        wr   = (wins / n * 100.0) if n > 0 else 0.0
+        txt  = f"SIM: trades={n}  PnL=¥{int(pnl):,}  WR={wr:.1f}%"
+        try:
+            if hasattr(self, "lbl_stats") and self.lbl_stats:
+                self.lbl_stats.config(text=txt)
+            elif hasattr(self, "lbl_misc") and self.lbl_misc:
+                self.lbl_misc.config(text=txt)
+        except Exception:
+            pass
+
+
+    def _wire_history_scrollbar(self):
+        # tree_hist をスクロール可能に（pack/grid どちらでも試みる）
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+            if not hasattr(self, "tree_hist") or not self.tree_hist:
+                return
+            tv = self.tree_hist
+            parent = tv.master
+            sb = ttk.Scrollbar(parent, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=sb.set)
+            info = parent.grid_info()
+            if info:   # grid 管理
+                r = int(tv.grid_info().get("row", 0))
+                c = int(tv.grid_info().get("column", 0))
+                sb.grid(row=r, column=c+1, sticky="ns")
+            else:      # pack 管理
+                sb.pack(side="right", fill="y")
+            self._hist_scrollbar = sb
+        except Exception:
+            pass
+
+
 
     # --- [5] place server-side bracket (TP + SL) ---------------------------------
     def place_server_bracket(self, symbol, exchange, hold_id, qty, entry_side,
@@ -3262,55 +3940,63 @@ class App(tk.Tk):
 
 
     def _sim_close(self, exit_price: float, reason="MANUAL"):
-        """SIMポジションをクローズし、履歴に残す。必ず self.pos=None にする。"""
-        try:
-            p = getattr(self, "pos", None)
-            if not p:
-                self._log("SIM", "close: no position")
-                return
+        """SIMポジションをクローズして履歴・統計を更新。最終的に self.pos=None。"""
+        import time
+        p = getattr(self, "pos", None)
+        if not p:
+            self._log("SIM", "close: no position")
+            return
 
-            side  = (p.get("side") or "").upper()
+        try:
+            side  = (p.get("side") or "").upper()         # "BUY" / "SELL" （保有側）
             qty   = int(p.get("qty") or 0)
             entry = float(p.get("entry"))
+            if qty <= 0:
+                self._log("SIM", "close: qty<=0"); return
 
-            ts    = self.tick_size or 1.0
-            ticks = ((exit_price - entry)/ts) if side == "BUY" else ((entry - exit_price)/ts)
+            tsz   = float(getattr(self, "tick_size", 1.0) or 1.0)
+            ticks = (exit_price - entry)/tsz if side == "BUY" else (entry - exit_price)/tsz
             pnl   = (exit_price - entry)*qty  if side == "BUY" else (entry - exit_price)*qty
 
-            # 履歴記録（実装があればそれを使う）
+            close_side = "SELL" if side == "BUY" else "BUY"
             try:
-                if hasattr(self, "_append_sim_history"):
-                    self._append_sim_history(side=side, qty=qty, entry=entry,
-                                            exit=exit_price, ticks=ticks, pnl=pnl, reason=reason)
-                elif hasattr(self, "tree_hist"):
-                    now = time.strftime("%Y-%m-%d %H:%M:%S")
-                    vals = (now, self.symbol.get(), side, qty,
-                            f"{entry:.1f}", f"{exit_price:.1f}",
-                            f"{ticks:+.1f}", f"{int(pnl):,}", reason)
-                    # UIはメインスレッドで
-                    self.ui_call(self.tree_hist.insert, "", 0, values=vals)
-            except Exception as e:
-                self._log_exc("SIM", e)
-
-            # ポジションを確実にクリア
-            self.pos = None
-
-            # ログとUI更新
-            self._log("SIM", f"CLOSE {side} {qty} @ {exit_price:.1f} ({reason}) pnl=¥{int(pnl):,} ({ticks:+.1f}t)")
-            try:
-                self.ui_call(self._update_summary)
-                self.ui_call(self._update_simpos)   # ← サマリーの「SIM: —」更新
+                symbol = (self.symbol.get() or "").strip()
             except Exception:
-                pass
+                symbol = (getattr(self, "current_symbol", "") or "").strip()
+
+            # === 唯一の呼び出しポイント：履歴1行追加（内部で集計まで実行） ===
+            self._append_sim_history(
+                ts=time.strftime("%Y-%m-%d %H:%M:%S"),
+                symbol=symbol,
+                side=close_side,
+                qty=qty,
+                entry=float(entry),
+                exit=float(exit_price),
+                ticks=float(ticks),
+                pnl=float(pnl),
+                reason=f"EXIT:{reason}"
+            )
+            self._update_stats_from_tree("SIM")
+
+            self._log("SIM", f"CLOSE {side} {qty} @ {exit_price:.1f} ({reason}) "
+                            f"pnl=¥{int(pnl):,} ({ticks:+.1f}t)")
 
         except Exception as e:
             self._log_exc("SIM", e)
-            # エラーでも表示だけは矛盾しないようにする（好みに応じてコメントアウト可）
+        finally:
+            self.pos = None
             try:
-                self.pos = None
-                self.ui_call(self._update_simpos)
+                if hasattr(self, "ui_call") and callable(self.ui_call):
+                    if hasattr(self, "_update_simpos"):              self.ui_call(self._update_simpos)
+                    if hasattr(self, "_update_sim_summary"):         self.ui_call(self._update_sim_summary)
+                    if hasattr(self, "_update_sim_stats_from_tree"): self.ui_call(self._update_sim_stats_from_tree)
+                else:
+                    if hasattr(self, "_update_simpos"):              self._update_simpos()
+                    if hasattr(self, "_update_sim_summary"):         self._update_sim_summary()
+                    if hasattr(self, "_update_sim_stats_from_tree"): self._update_sim_stats_from_tree()
             except Exception:
                 pass
+
 
 
     def refresh_hist_table(self):
@@ -3418,6 +4104,23 @@ class App(tk.Tk):
             if (not armed) or (not is_prod) or (not real_on):
                 reason = "未ARM" if not armed else ("検証(:18081)" if not is_prod else "実発注OFF")
                 self._log("ORD", f"{reason} → SIMルートへ")
+                if getattr(self, "pos", None):
+                    cur = self.pos
+                    # 同じ方向なら新規をスキップ（多重建て防止）
+                    if cur.get("side") == side:
+                        self._log("SIM", f"skip enter: pos exists side={side} entry={cur.get('entry')}")
+                        return
+                    # 反対方向なら一度クローズしてから反転
+                    px_close = float(self.last_price or cur.get("entry") or 0.0)
+                    self._sim_close(px_close, reason="REV")   # 履歴に EXIT:REV が出るはず
+                if getattr(self, "pos", None):
+                    cur = self.pos
+                    if cur.get("side") == side:
+                        self._log("SIM", f"skip: already {side} @ {cur.get('entry')}")
+                        return
+                    # 反対方向なら一旦クローズしてから反転
+                    px_close = float(self.last_price or cur.get("entry") or 0.0)
+                    self._sim_close(px_close, reason="REV")
                 return self._sim_enter(side)
 
             # ------- ここから実弾 (/sendorder) -------
@@ -3478,28 +4181,18 @@ class App(tk.Tk):
             px = self.last_price
         qty = int(getattr(self, "_qty_cached", self.qty.get() if hasattr(self,"qty") else 0))
         if px is None or qty <= 0:
-            self._log("SIM", "NO-ENTRY（価格/数量不足）")
-            return
+            self._log("SIM", "NO-ENTRY（価格/数量不足）"); return
 
         sym = (self.symbol.get() or "").strip()
-        self.sim_pos = {"side": side, "qty": qty, "entry": float(px),
-                        "ts": time.time(), "symbol": sym, "row_id": None}
+        # ★ SIM でも self.pos に統一（peak 初期化も）
+        self.pos = {"side": side, "qty": qty, "entry": float(px),
+                    "peak": float(px), "ts": time.time(), "symbol": sym}
 
-        # 履歴（ENTRY行を先に差し込んで、row_idを保持。EXIT時に更新）
-        row_id = None
-        try:
-            if hasattr(self, "tree_hist") and self.tree_hist:
-                tstr = time.strftime("%H:%M:%S")
-                row_id = self.tree_hist.insert(
-                    "", 0,
-                    values=(tstr, sym, side, qty, f"{px:.1f}", "", "", "", f"ENTER:{reason}")
-                )
-        except Exception:
-            pass
-        self.sim_pos["row_id"] = row_id
-
+        # 履歴（ENTRY 行を記録）
+        self._append_sim_history(ts=self._nowstr_full(), symbol=sym, side=side,
+                                qty=qty, entry=float(px), reason=f"ENTER:{reason}")
         self._log("SIM", f"ENTRY {side} {qty} @ {px}")
-        self.ui_call(self._update_simpos_summary)
+        self.ui_call(self._update_simpos_summary) if hasattr(self,"_update_simpos_summary") else None
 
     def _sim_flatten(self, reason: str = "MANUAL"):
         """SIM建玉の成行決済（Bestが無ければlast）。履歴更新して建玉クリア。"""
@@ -3530,13 +4223,13 @@ class App(tk.Tk):
         # 既存のENTRY行があれば更新、なければ新規でEXIT行を追加
         try:
             if self.sim_pos.get("row_id") and hasattr(self, "tree_hist"):
-                tstr = time.strftime("%H:%M:%S")
+                tstr = self._nowstr_full()
                 self.tree_hist.item(
                     self.sim_pos["row_id"],
                     values=(tstr, sym, side, qty, f"{ent:.1f}", f"{ex:.1f}", ticks, int(round(pnl)), reason)
                 )
             elif hasattr(self, "tree_hist"):
-                tstr = time.strftime("%H:%M:%S")
+                tstr = self._nowstr_full()
                 self.tree_hist.insert(
                     "", 0,
                     values=(tstr, sym, side, qty, f"{ent:.1f}", f"{ex:.1f}", ticks, int(round(pnl)), reason)
@@ -3840,6 +4533,10 @@ class App(tk.Tk):
                 st=str(o.get("State", o.get("Status","")))
                 oid=str(o.get("ID", o.get("OrderId","")))
                 self.tree_ord.insert("", "end", values=(oid,sym,name,side,qty,price,st))
+        except Exception:
+            pass
+        try:
+            self._update_stats_from_tree("LIVE")  # LIVE履歴から集計するだけ。tree_ord は参照しません
         except Exception:
             pass
 
