@@ -3355,7 +3355,7 @@ class App(tk.Tk):
 
 
 
-    def _send_entry_order(self, side: str):
+    def _send_entry_order(self, side: str, price: float | None = None, *, is_auto: bool = False):
         """
         実弾条件を満たさない場合は即SIMルートへ。
         実弾条件（:18080 + real_trade ON + armed）が揃えば /sendorder を叩く。
@@ -3423,9 +3423,14 @@ class App(tk.Tk):
             # ------- ここから実弾 (/sendorder) -------
             url = self._base_url() + "/sendorder"
             acct = 4 if str(self.account_type.get()).endswith("(4)") else 2
-            price = self.best_ask if side == "BUY" else self.best_bid
-            if price is None: price = self.last_price
-            if price is None:
+            #price = self.best_ask if side == "BUY" else self.best_bid
+            #if price is None: price = self.last_price
+            #if price is None:
+            if px is None:
+                px = self.best_ask if side == "BUY" else self.best_bid
+            if px is None:
+                px = self.last_price
+            if px is None:
                 self._log("ORD", "価格未取得のためキャンセル（SIM/実弾ともに不可）")
                 return
 
@@ -3439,7 +3444,7 @@ class App(tk.Tk):
                 "AccountType": acct,
                 "Qty": int(getattr(self, "_qty_cached", self.qty.get() if hasattr(self,"qty") else 0)),
                 "FrontOrderType": 20,
-                "Price": float(price),
+                "Price": float(px),
                 "ExpireDay": 0,
                 "DelivType": 0
             }
@@ -3455,7 +3460,7 @@ class App(tk.Tk):
                 resp = r.json(); oid = resp.get("OrderId") or resp.get("ID")
             except Exception:
                 oid = None
-            self._append_live_history(order_id=oid, side=side, price=float(price),
+            self._append_live_history(order_id=oid, side=side, price=float(px),
                                     qty=int(payload["Qty"]), status="SENT")
         except Exception as e:
             self._log("ORD", f"ERROR(sendorder): {e}")
