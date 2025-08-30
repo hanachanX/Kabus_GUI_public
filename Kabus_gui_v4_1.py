@@ -96,7 +96,50 @@ class App(CompatV3StubsJA, tk.Tk):
         self._my_orders = {}        # {(side, price): qty} 画面上に載せたい自分の指値
         self._working   = {}        # {order_id: {"side":..,"price":..,"qty":..}} 監視対象
         self._polling_orders = False
+        # AUTOフラグとスレッド
+        self.auto_on = False
+        self._auto_th = None
+        self._auto_stop = threading.Event()
+        self._auto_lock = threading.Lock()
+        # AUTO設定（最初に dict を作る！）
+        self.auto_cfg = {
+            "qty": 100,
+            "tp_ticks": 7,
+            "sl_ticks": 5,
+            "max_spread": 2.0,
+            "min_abs_imb": 0.20,
+            "require_inv": True,
+            "poll_ms": 200,
+            "tick_size": 1.0,
+            # トレーリング
+            "trail_on": False,
+            "trail_ticks": 5,
+            "trail_step_ticks": 1,
+            "trail_arm_ticks": 3,
+            "trail_to_be": True,
+            "be_offset_ticks": 0,
+        }
+        # トレーリングの内部状態
+        self._trail_peak = None   # ロング時: 最高値(bid)、ショート時: 最安値(ask)
+        self._trail_armed = False
+        # SIMポジション/注文
+        @dataclass
+        class SimPosition:
+            side: str = ""     # "BUY"/"SELL"
+            qty: int = 0
+            avg: float = 0.0
+            entry_ts: str = ""
+            entry_reason: str = ""
 
+        @dataclass
+        class SimOrder:
+            id: int
+            side: str
+            price: float
+            qty: int
+            ts: str
+            kind: str          # "ENTRY"/"TP"/"SL"
+            status: str = "OPEN"
         # 成績行用の StringVar
         self.var_simstats = tk.StringVar(value="SIM: Trades: 0 | Win: 0 (0.0%) | P&L: ¥0 | Avg: 0.00t")
         self.var_livestats = tk.StringVar(value="LIVE: Trades: 0 | Win: 0 (0.0%) | P&L: ¥0 | Avg: 0.00t")
@@ -141,7 +184,7 @@ class App(CompatV3StubsJA, tk.Tk):
         if not hasattr(self, "arm_var"):
             self.arm_var = tk.BooleanVar(value=False)  # デフォルトは実弾OFF
 
-
+        self._update_sim_summary()
         # --- 1秒毎に成績ラベルを再集計（念のため）---
         self.after(1000, self._stats_heartbeat)
 
@@ -251,6 +294,9 @@ class App(CompatV3StubsJA, tk.Tk):
         # ===== Tabs =====
         tabs = ttk.Notebook(right)
         tabs.pack(fill="both", expand=True)
+        self.main_nb = tabs
+        self._build_tab_risk()  # ← _build_tab_risk は self.main_nb を使うのでそのままでOK
+        
 
         # --- 板・歩み値 ---
         tab_tape = ttk.Frame(tabs); tabs.add(tab_tape, text="板・歩み値")
@@ -674,6 +720,172 @@ class App(CompatV3StubsJA, tk.Tk):
         for old, fn in method_alias.items():
             if not hasattr(self, old):
                 setattr(self, old, fn)
+
+    # ----------------------------
+    # TP/SL　トレーリング
+    # ----------------------------
+    def _build_tab_risk(self):
+
+        tab = ttk.Frame(self.main_nb); self.main_nb.add(tab, text="決済設定")
+
+        frm = ttk.LabelFrame(tab, text="TP/SL（ticks）"); frm.pack(fill="x", padx=8, pady=(8,4))
+        self.var_tp = tk.IntVar(value=self.auto_cfg["tp_ticks"])
+        self.var_sl = tk.IntVar(value=self.auto_cfg["sl_ticks"])
+        ttk.Label(frm, text="TP").grid(row=0, column=0, padx=6, pady=6, sticky="e")
+        ttk.Spinbox(frm, from_=1, to=999, textvariable=self.var_tp, width=6).grid(row=0, column=1, padx=2, pady=6)
+        ttk.Label(frm, text="SL").grid(row=0, column=2, padx=6, pady=6, sticky="e")
+        ttk.Spinbox(frm, from_=1, to=999, textvariable=self.var_sl, width=6).grid(row=0, column=3, padx=2, pady=6)
+        ttk.Label(frm, text=f"tick={self.auto_cfg['tick_size']}円").grid(row=0, column=4, padx=8, sticky="w")
+
+        tr = ttk.LabelFrame(tab, text="トレーリング"); tr.pack(fill="x", padx=8, pady=(4,8))
+        self.var_trail_on    = tk.BooleanVar(value=self.auto_cfg["trail_on"])
+        self.var_trail_dist  = tk.IntVar(value=self.auto_cfg["trail_ticks"])
+        self.var_trail_step  = tk.IntVar(value=self.auto_cfg["trail_step_ticks"])
+        self.var_trail_arm   = tk.IntVar(value=self.auto_cfg["trail_arm_ticks"])
+        self.var_trail_be    = tk.BooleanVar(value=self.auto_cfg["trail_to_be"])
+        self.var_be_offset   = tk.IntVar(value=self.auto_cfg["be_offset_ticks"])
+
+        ttk.Checkbutton(tr, text="トレーリング有効", variable=self.var_trail_on).grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        ttk.Label(tr, text="距離(ticks)").grid(row=1, column=0, padx=6, pady=2, sticky="e")
+        ttk.Spinbox(tr, from_=1, to=999, textvariable=self.var_trail_dist, width=6).grid(row=1, column=1, padx=2, pady=2)
+
+        ttk.Label(tr, text="ステップ(ticks)").grid(row=1, column=2, padx=6, pady=2, sticky="e")
+        ttk.Spinbox(tr, from_=1, to=100, textvariable=self.var_trail_step, width=6).grid(row=1, column=3, padx=2, pady=2)
+
+        ttk.Label(tr, text="発動(建値から ticks)").grid(row=2, column=0, padx=6, pady=2, sticky="e")
+        ttk.Spinbox(tr, from_=0, to=999, textvariable=self.var_trail_arm, width=6).grid(row=2, column=1, padx=2, pady=2)
+
+        ttk.Checkbutton(tr, text="建値まで引上げ(BE)", variable=self.var_trail_be).grid(row=2, column=2, padx=6, pady=2, sticky="w")
+        ttk.Label(tr, text="BEオフセット(ticks)").grid(row=2, column=3, padx=6, pady=2, sticky="e")
+        ttk.Spinbox(tr, from_=0, to=50, textvariable=self.var_be_offset, width=6).grid(row=2, column=4, padx=2, pady=2)
+
+        btns = ttk.Frame(tab); btns.pack(fill="x", padx=8, pady=(0,8))
+        ttk.Button(btns, text="適用", command=self._apply_risk_from_ui).pack(side="left", padx=6)
+        ttk.Button(btns, text="OCO再設定（現在の建玉）", command=self._refresh_oco_from_settings).pack(side="left", padx=6)
+
+
+    def _apply_risk_from_ui(self):
+        try:
+            self.auto_cfg["tp_ticks"]        = int(self.var_tp.get())
+            self.auto_cfg["sl_ticks"]        = int(self.var_sl.get())
+            self.auto_cfg["trail_on"]        = bool(self.var_trail_on.get())
+            self.auto_cfg["trail_ticks"]     = int(self.var_trail_dist.get())
+            self.auto_cfg["trail_step_ticks"]= int(self.var_trail_step.get())
+            self.auto_cfg["trail_arm_ticks"] = int(self.var_trail_arm.get())
+            self.auto_cfg["trail_to_be"]     = bool(self.var_trail_be.get())
+            self.auto_cfg["be_offset_ticks"] = int(self.var_be_offset.get())
+            self._log("SET", f"決済設定を適用: TP={self.auto_cfg['tp_ticks']} SL={self.auto_cfg['sl_ticks']} "
+                            f"TRAIL={'ON' if self.auto_cfg['trail_on'] else 'OFF'} "
+                            f"dist={self.auto_cfg['trail_ticks']} step={self.auto_cfg['trail_step_ticks']} "
+                            f"arm={self.auto_cfg['trail_arm_ticks']} BE={self.auto_cfg['trail_to_be']}(+{self.auto_cfg['be_offset_ticks']})")
+        except Exception as e:
+            try:
+                self._log_exc("_apply_risk_from_ui", e)
+            except TypeError:
+                self._log_exc(e, where="_apply_risk_from_ui")
+
+    def _refresh_oco_from_settings(self):
+        """ 現在の建玉に対してTP/SLの未約定注文を最新設定で差し替え（SIM） """
+        try:
+            p = self._sim_pos
+            if p.qty == 0: 
+                self._log("AUTO", "OCO再設定: 建玉なし"); return
+
+            # 既存のOPENなTP/SL指値をキャンセル扱いにして、新しく置き直し
+            for o in self._sim_orders:
+                if o.status=="OPEN" and o.kind in ("TP","SL"): o.status="CANCELLED"
+
+            t = self.auto_cfg["tp_ticks"] * self.auto_cfg["tick_size"]
+            s = self.auto_cfg["sl_ticks"] * self.auto_cfg["tick_size"]
+            if p.side == "BUY":
+                self._place_sim_limit("SELL", p.avg + t, p.qty, "TP")
+                self._place_sim_limit("SELL", p.avg - s, p.qty, "SL")
+            else:
+                self._place_sim_limit("BUY",  p.avg - t, p.qty, "TP")
+                self._place_sim_limit("BUY",  p.avg + s, p.qty, "SL")
+
+            # トレーリング状態もリセット
+            self._trail_peak = None; self._trail_armed = False
+            self._log("AUTO", "OCO再設定済み（TP/SLを最新設定に更新）")
+        except Exception as e:
+            try:
+                self._log_exc("refresh_oco_from_settings", e)
+            except TypeError:
+                # もし _log_exc(e, where=...) 型の実装ならこちら
+                self._log_exc(e, where="refresh_oco_from_settings")
+
+    def _find_open_order(self, kind: str):
+        for o in self._sim_orders:
+            if o.status == "OPEN" and o.kind == kind:
+                return o
+        return None
+
+    def _update_trailing(self, q):
+        """ 建玉がある時にSL指値を価格進行に合わせて更新（SIM） """
+        try:
+            if not self.auto_cfg["trail_on"]: return
+            p = self._sim_pos
+            if p.qty == 0: return
+
+            tick = self.auto_cfg["tick_size"]
+            dist = self.auto_cfg["trail_ticks"] * tick
+            step = self.auto_cfg["trail_step_ticks"] * tick
+            arm  = self.auto_cfg["trail_arm_ticks"] * tick
+            be_on= self.auto_cfg["trail_to_be"]
+            be_of= self.auto_cfg["be_offset_ticks"] * tick
+
+            sl = self._find_open_order("SL")
+            if not sl: return  # SLがなければ何もしない
+
+            # 有利方向の“到達点”を更新
+            if p.side == "BUY":
+                ref = q["bid"] or q["last"] or 0.0
+                if ref <= 0: return
+                self._trail_peak = ref if (self._trail_peak is None) else max(self._trail_peak, ref)
+                gained = (self._trail_peak - p.avg)
+                if gained >= arm: 
+                    self._trail_armed = True
+                if not self._trail_armed: 
+                    return
+
+                # 目標SL（距離=distを保つ）。BEモードが有効かつ十分進んだら建値(or +offset)を下限に
+                target_sl = self._trail_peak - dist
+                if be_on:
+                    target_sl = max(target_sl, p.avg + be_of)
+
+                # ステップ更新：現在のSLより step 以上 上がる時だけ更新
+                if target_sl > sl.price + step:
+                    old = sl.price
+                    sl.price = target_sl
+                    self._auto_log("トレーリング更新", f"SL {old:.1f}→{sl.price:.1f}", q, self._derive_metrics(q))
+
+            else:  # SELL
+                ref = q["ask"] or q["last"] or 0.0
+                if ref <= 0: return
+                self._trail_peak = ref if (self._trail_peak is None) else min(self._trail_peak, ref)
+                gained = (p.avg - self._trail_peak)
+                if gained >= arm:
+                    self._trail_armed = True
+                if not self._trail_armed:
+                    return
+
+                target_sl = self._trail_peak + dist
+                if be_on:
+                    target_sl = min(target_sl, p.avg - be_of)
+
+                if target_sl < sl.price - step:
+                    old = sl.price
+                    sl.price = target_sl
+                    self._auto_log("トレーリング更新", f"SL {old:.1f}→{sl.price:.1f}", q, self._derive_metrics(q))
+        except Exception as e:
+            try:
+                self._log_exc("_update_trailing", e)
+            except TypeError:
+                self._log_exc(e, where="_update_trailing")
+
+
+
+
 
     #---------------
     # 資金　建玉
@@ -2340,6 +2552,271 @@ class App(CompatV3StubsJA, tk.Tk):
         except Exception as e:
             self._log_exc("HTTP", e)
 
+    # -----------------
+    # AUTO
+    # -----------------
+
+    # ====== 既存：SIM履歴の行追加（v3日本語化） ======
+    def _append_sim_history(self, fill: dict):
+        """
+        fill 例:
+        {
+            "約定時刻": "2025-08-30 10:12:34",
+            "銘柄": "7203",
+            "サイド": "買",
+            "数量": 100,
+            "建値": 7710.0,
+            "決済時刻": "2025-08-30 10:13:10",
+            "決済値": 7717.0,
+            "損益": 700,
+            "理由": "TP成立（imb=+0.34, INV, spread=0.5）"
+        }
+        """
+        try:
+            # ツリーが未構築でも落とさない
+            tree = getattr(self, "tree_sim", None)
+            if tree:
+                # 無ければカラム作成（日本語）
+                if not tree["columns"]:
+                    cols = ("約定時刻","銘柄","サイド","数量","建値","決済時刻","決済値","損益","理由")
+                    tree.configure(columns=cols, show="headings")
+                    for c,w in (("約定時刻",160),("銘柄",90),("サイド",60),("数量",60),
+                                ("建値",80),("決済時刻",160),("決済値",80),("損益",80),("理由",220)):
+                        tree.heading(c, text=c); tree.column(c, width=w, anchor="center")
+                vals = (fill.get("約定時刻",""), fill.get("銘柄",""), fill.get("サイド",""),
+                        fill.get("数量",0), fill.get("建値",0.0), fill.get("決済時刻",""),
+                        fill.get("決済値",0.0), fill.get("損益",0), fill.get("理由",""))
+                tree.insert("", "end", values=vals)
+            # 集計ラベル更新（v4関数があれば使用）
+            upd = getattr(self, "_update_stats_from_tree", None)
+            if upd: upd("SIM")
+        except Exception:
+            self._log_exc("append_sim_history")
+
+    # ====== 補助: サマリーのポジション表示更新 ======
+    def _update_sim_pos_label(self):
+        try:
+            if not self.lbl_pos_sim: return
+            p = self._sim_pos
+            if p.qty == 0:
+                self.lbl_pos_sim.config(text="—")
+            else:
+                jp_side = "買" if p.side == "BUY" else "売"
+                self.lbl_pos_sim.config(text=f"{jp_side} {p.qty}＠{p.avg:.1f}")
+        except Exception:
+            self._log_exc("update_sim_pos_label")
+
+    # ====== 既存メトリクス取得（無ければ簡易算出） ======
+    def _current_quote(self):
+        # 既存属性がある前提。無ければ 0 扱い
+        bid = float(getattr(self, "best_bid", 0) or 0)
+        ask = float(getattr(self, "best_ask", 0) or 0)
+        bq  = float(getattr(self, "best_bidq", 0) or 0)
+        aq  = float(getattr(self, "best_askq", 0) or 0)
+        last= float(getattr(self, "last_price", 0) or 0)
+        sym = getattr(self, "current_symbol", "") or getattr(self, "symbol", "")
+        return {"bid":bid, "ask":ask, "bidq":bq, "askq":aq, "last":last, "sym":sym}
+
+    def _derive_metrics(self, q):
+        # 既存に self._derive_book_metrics があればそれを尊重
+        try:
+            if hasattr(self, "_derive_book_metrics"):
+                return self._derive_book_metrics(q["bid"], q["ask"], q["bidq"], q["askq"], q["last"])
+        except Exception:
+            pass
+        # 簡易
+        spread = (q["ask"] - q["bid"]) if (q["ask"] and q["bid"]) else 0.0
+        inv = (q["ask"] <= q["bid"]) if (q["ask"] and q["bid"]) else False
+        imb = None
+        if (q["bidq"] + q["askq"]) > 0:
+            imb = (q["bidq"] - q["askq"]) / (q["bidq"] + q["askq"])  # -1..+1
+        return {"spread": spread, "_inv": inv, "imbalance": imb}
+
+    # ====== ログ整形（日本語） ======
+    def _auto_log(self, action: str, reason: str, q=None, m=None):
+        # action: "見送り" / "指値発注" / "約定" / "決済(TP/SL)" など
+        try:
+            parts = [action]
+            if reason: parts.append(f"理由: {reason}")
+            if q:
+                parts.append(f"bid={q['bid']:.1f} ask={q['ask']:.1f} spread={m['spread']:.2f}")
+                if m.get('imbalance') is not None: parts.append(f"imb={m['imbalance']:+.2f}")
+                parts.append("INV" if m.get("_inv") else "非INV")
+            self._log("AUTO", " | ".join(parts))
+        except Exception:
+            self._log_exc("auto_log")
+
+    # ====== 発注・約定（SIM） ======
+    def _place_sim_limit(self, side:str, price:float, qty:int, kind:str):
+        oid = self._sim_next_oid; self._sim_next_oid += 1
+        o = SimOrder(id=oid, side=side, price=price, qty=qty, ts=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), kind=kind)
+        self._sim_orders.append(o)
+        return o
+
+    def _try_fill_orders(self, q):
+        """ ベスト気配で指値がヒットしたら即約定 """
+        filled = []
+        for o in self._sim_orders:
+            if o.status != "OPEN": continue
+            if o.side == "BUY":
+                # 買い指値は ask <= 価格 で約定
+                if q["ask"] and q["ask"] <= o.price:
+                    o.status = "FILLED"; filled.append(o)
+            else:
+                # 売り指値は bid >= 価格 で約定
+                if q["bid"] and q["bid"] >= o.price:
+                    o.status = "FILLED"; filled.append(o)
+        for o in filled:
+            self._on_order_filled(o, q)
+
+    def _on_order_filled(self, o: SimOrder, q):
+        if o.kind == "ENTRY":
+            # オープン
+            self._open_position(o.side, o.qty, o.price)
+            # OCO（TP/SL）を建てる
+            t = self.auto_cfg["tp_ticks"] * self.auto_cfg["tick_size"]
+            s = self.auto_cfg["sl_ticks"] * self.auto_cfg["tick_size"]
+            if o.side == "BUY":
+                self._place_sim_limit("SELL", o.price + t, o.qty, "TP")
+                self._place_sim_limit("SELL", o.price - s, o.qty, "SL")
+            else:
+                self._place_sim_limit("BUY", o.price - t, o.qty, "TP")
+                self._place_sim_limit("BUY", o.price + s, o.qty, "SL")
+            self._auto_log("約定（建玉）", "", q, self._derive_metrics(q))
+        else:
+            # 決済
+            reason = "TP成立" if o.kind == "TP" else "SL成立"
+            self._close_position(o.qty, o.price, reason)
+
+    def _open_position(self, side, qty, price):
+        p = self._sim_pos
+        p.side = side
+        p.qty = qty
+        p.avg = float(price)
+        p.entry_ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.after(0, self._update_sim_pos_label)
+        # ★ここでサマリー反映（StringVar／ラベル）
+        self.after(0, self._update_sim_summary)
+
+    def _close_position(self, qty, price, reason):
+        p = self._sim_pos
+        if p.qty == 0: return
+        # P&L 円換算（1円=1tick想定）
+        sign = +1 if p.side == "BUY" else -1
+        pnl = int((price - p.avg) * sign * qty)
+        # SIM履歴（日本語1行）
+        row = {
+            "約定時刻": p.entry_ts,
+            "銘柄": getattr(self, "current_symbol", "") or getattr(self, "symbol", ""),
+            "サイド": "買" if p.side=="BUY" else "売",
+            "数量": qty,
+            "建値": p.avg,
+            "決済時刻": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "決済値": float(price),
+            "損益": pnl,
+            "理由": f"{reason}（{p.entry_reason}）" if p.entry_reason else reason,
+        }
+        self.after(0, self._append_sim_history, row)
+        # ポジション解消
+        self._sim_pos = SimPosition()
+
+        # 建っているOCOは全取消
+        for o in self._sim_orders:
+            if o.status=="OPEN" and o.kind in ("TP","SL"): o.status="CANCELLED"
+        self.after(0, self._update_sim_pos_label)
+        # ★ここでサマリー反映（“—”に戻る）
+        self.after(0, self._update_sim_summary)
+
+    def _update_sim_pos_label(self):
+        # 互換：新実装へ集約
+        self._update_sim_summary()
+
+    # ====== AUTO意思決定（見送りロジックは日本語でログ） ======
+    def _auto_decide(self, q, m):
+        """
+        戻り値: (action, side, price, reason)
+        action: "SKIP" / "ENTRY"
+        """
+        # 既にポジションがあれば新規は発注しない（OCO待ち）
+        if self._sim_pos.qty != 0:
+            return ("SKIP", None, None, "既に建玉あり（新規停止）")
+
+        # フィルタ群
+        if m["spread"] <= 0:
+            return ("SKIP", None, None, "板不整合（スプレッド0以下）")
+
+        if m["spread"] > self.auto_cfg["max_spread"]:
+            return ("SKIP", None, None, f"見送り：スプレッド広い({m['spread']:.2f} > {self.auto_cfg['max_spread']:.2f})")
+
+        imb = m.get("imbalance", None)
+        if imb is None:
+            return ("SKIP", None, None, "見送り：板数量データ不足")
+
+        if abs(imb) < self.auto_cfg["min_abs_imb"]:
+            return ("SKIP", None, None, f"見送り：板バランス弱い(|imb|={abs(imb):.2f} < {self.auto_cfg['min_abs_imb']:.2f})")
+
+        if self.auto_cfg["require_inv"] and not m.get("_inv", False):
+            return ("SKIP", None, None, "見送り：INV不成立（食い込み無し）")
+
+        # 方向決定：imb>0は買い優位、imb<0は売り優位
+        if imb > 0:
+            side = "BUY"; price = q["bid"]  # 指値は現行bid（参加）
+            reason = f"買い優位（imb={imb:+.2f}, spread={m['spread']:.2f}" + (", INV" if m["_inv"] else "") + ")"
+        else:
+            side = "SELL"; price = q["ask"]
+            reason = f"売り優位（imb={imb:+.2f}, spread={m['spread']:.2f}" + (", INV" if m["_inv"] else "") + ")"
+
+        return ("ENTRY", side, price, reason)
+
+    # ====== AUTO ループ ======
+    def toggle_auto(self):
+        if self.auto_on:
+            self._auto_stop.set()
+            if self._auto_th: self._auto_th.join(timeout=1.5)
+            self.auto_on = False
+            self._auto_log("AUTO停止", "", None, {})
+            return
+        self._auto_stop.clear()
+        self.auto_on = True
+        self._auto_th = threading.Thread(target=self._auto_loop, daemon=True); self._auto_th.start()
+        self._auto_log("AUTO開始", "", None, {})
+
+    def _auto_loop(self):
+        try:
+            while not self._auto_stop.is_set():
+                time.sleep(self.auto_cfg["poll_ms"]/1000.0)
+                q = self._current_quote()
+                if not (q["bid"] and q["ask"]): continue
+                m = self._derive_metrics(q)
+
+                # 指値のヒット監視（常に先に判定）
+                with self._auto_lock:
+                    self._try_fill_orders(q)
+
+                # 新規判断
+                act, side, price, reason = self._auto_decide(q, m)
+                if act == "SKIP":
+                    # ノイズ抑制：INVやスプレッド等の条件が同じ場合は間引き可（dedup_key）
+                    self._auto_log("見送り", reason, q, m)
+                    continue
+
+                # 指値発注
+                with self._auto_lock:
+                    o = self._place_sim_limit(side, price, self.auto_cfg["qty"], "ENTRY")
+                    # エントリー根拠（ポジションに覚えさせる）
+                    self._sim_pos.entry_reason = reason
+                self._auto_log("指値発注", f"{'買' if side=='BUY' else '売'} {self.auto_cfg['qty']}＠{price:.1f} | {reason}", q, m)
+
+                # 発注直後にヒットしていれば執行
+                with self._auto_lock:
+                    self._try_fill_orders(q)
+        except Exception as e:
+            try:
+                self._log_exc("_auto_loop", e)
+            except TypeError:
+                self._log_exc(e, where="_auto_loop")
+
+
 
 
     def _base_url(self) -> str:
@@ -2788,6 +3265,181 @@ class App(CompatV3StubsJA, tk.Tk):
             self.log_box.see("end")
         except Exception:
             pass
+
+    # ------------------
+    # サマリー
+    # ------------------
+
+
+    def _update_sim_summary(self):
+        """SIMサマリー（保有＆株数）を StringVar / ラベル に反映"""
+        try:
+            p = getattr(self, "_sim_pos", None)
+            if not p: return
+            if p.qty == 0:
+                text = "—"
+                qty  = str(self.qty.get()) if hasattr(self, "qty") else "0"
+            else:
+                side_jp = "買" if p.side == "BUY" else "売"
+                text = f"{side_jp} {p.qty}＠{p.avg:.1f}"
+                qty  = str(p.qty)
+
+            # StringVar 優先（v4 UI）
+            if hasattr(self, "var_sim_pos") and self.var_sim_pos:
+                self.var_sim_pos.set(text)
+            if hasattr(self, "var_sim_qty") and self.var_sim_qty:
+                self.var_sim_qty.set(qty)
+
+            # v3互換のラベルがある場合も更新（後方互換）
+            if getattr(self, "lbl_pos_sim", None):
+                self.lbl_pos_sim.config(text=text)
+        except Exception as e:
+            try:
+                self._log_exc("_update_sim_summary", e)
+            except TypeError:
+                self._log_exc(e, where="_update_sim_summary")
+
+
+    def _bind_qty_to_sim_summary(self):
+        # qty(IntVar) がある前提。無ければスキップ
+        try:
+            if hasattr(self, "qty") and hasattr(self.qty, "trace_add"):
+                def _on_qty_change(*_):
+                    # 建玉なしのときだけ既定数量を表示
+                    if getattr(self, "_sim_pos", None) and self._sim_pos.qty == 0:
+                        if hasattr(self, "var_sim_qty") and self.var_sim_qty:
+                            self.var_sim_qty.set(str(self.qty.get()))
+                self.qty.trace_add("write", _on_qty_change)
+        except Exception as e:
+            try:
+                self._log_exc("_bind_qty_to_sim_summary", e)
+            except TypeError:
+                self._log_exc(e, where="_bind_qty_to_sim_summary")
+
+
+    # ========== 成績行（SIM/LIVE）集計：StringVarに反映 ==========
+    def _fmt_yen(self, v):
+        try:
+            return f"¥{int(round(float(v))):,}"
+        except Exception:
+            return "¥0"
+
+    def _safe_float(self, x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    def _safe_int(self, x, default=0):
+        try:
+            return int(x)
+        except Exception:
+            return default
+
+    def _update_stats_from_tree(self, mode: str):
+        """
+        mode: "SIM" or "LIVE"
+        - SIM: tree_sim を前提（列： 約定時刻/銘柄/サイド/数量/建値/決済時刻/決済値/損益/理由）
+        - LIVE: tree_live があれば同様に集計（無ければスキップ）
+        出力:
+        var_simstats / var_livestats を更新（無ければ v3互換ラベルを更新）
+        """
+        try:
+            if mode == "SIM":
+                tree = getattr(self, "tree_sim", None)
+                var  = getattr(self, "var_simstats", None)
+                lbl  = getattr(self, "lbl_stats_sim", None)  # 互換
+                prefix = "SIM"
+            else:
+                tree = getattr(self, "tree_live", None)
+                var  = getattr(self, "var_livestats", None)
+                lbl  = getattr(self, "lbl_stats_live", None)  # あれば
+                prefix = "LIVE"
+
+            if not tree or not tree.get_children(""):
+                text = f"{prefix}: Trades: 0 | Win: 0 (0.0%) | P&L: ¥0 | Avg: 0.00t"
+                if var: var.set(text)
+                if lbl: lbl.config(text=text)
+                return
+
+            tick = float(self.auto_cfg.get("tick_size", 1.0)) if hasattr(self, "auto_cfg") else 1.0
+
+            n_trades = 0
+            wins = 0
+            pnl_sum = 0.0
+            ticks_acc = 0.0  # 取引毎のtick差の平均用
+
+            for iid in tree.get_children(""):
+                vals = tree.item(iid, "values")
+                # 期待順: [約定時刻, 銘柄, サイド(買/売), 数量, 建値, 決済時刻, 決済値, 損益, 理由]
+                side_j = (vals[2] if len(vals) > 2 else "") or ""
+                qty    = self._safe_int(vals[3] if len(vals) > 3 else 0, 0)
+                entry  = self._safe_float(vals[4] if len(vals) > 4 else 0.0, 0.0)
+                exitp  = self._safe_float(vals[6] if len(vals) > 6 else 0.0, 0.0)
+                pnl    = self._safe_float(vals[7] if len(vals) > 7 else 0.0, 0.0)
+
+                # 完結した行（決済値がある）だけ集計
+                if exitp == 0 and pnl == 0:
+                    continue
+
+                n_trades += 1
+                pnl_sum += pnl
+                if pnl > 0:
+                    wins += 1
+
+                # 平均tick: サイドから符号を決定
+                if tick > 0:
+                    if side_j.startswith("買"):
+                        t = (exitp - entry) / tick
+                    elif side_j.startswith("売"):
+                        t = (entry - exitp) / tick
+                    else:
+                        # サイド情報が無い場合は pnl と qty から推定（qty=0の場合は0）
+                        t = (pnl / (qty if qty else 1)) / tick
+                    ticks_acc += t
+
+            if n_trades == 0:
+                avg_ticks = 0.0
+                winp = 0.0
+            else:
+                avg_ticks = ticks_acc / n_trades
+                winp = (wins / n_trades) * 100.0
+
+            text = f"{prefix}: Trades: {n_trades} | Win: {wins} ({winp:.1f}%) | P&L: {self._fmt_yen(pnl_sum)} | Avg: {avg_ticks:.2f}t"
+
+            if var:
+                var.set(text)
+            if lbl:
+                lbl.config(text=text)
+
+        except Exception as e:
+            try:
+                self._log_exc("_update_stats_from_tree", e)
+            except TypeError:
+                self._log_exc(e, where="_update_stats_from_tree")
+
+
+    def _update_live_summary(self, side:str=None, qty:int=None, avg:float=None):
+        try:
+            if side is None or qty is None or avg is None:
+                text, n = "—", (self.qty.get() if hasattr(self,"qty") else 0)
+            else:
+                text = f"{'買' if side=='BUY' else '売'} {qty}＠{avg:.1f}"
+                n = qty
+            if hasattr(self, "var_live_pos") and self.var_live_pos:
+                self.var_live_pos.set(text)
+            if hasattr(self, "var_live_qty") and self.var_live_qty:
+                self.var_live_qty.set(str(n))
+        except Exception:
+            self._log_exc("update_live_summary")
+
+
+    # v3→v4 互換（既に作っていなければ）
+
+
+    def _update_sim_stats_from_tree(self):
+        self._update_stats_from_tree("SIM")
+
 
 
 # ======================================================
