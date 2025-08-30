@@ -1,0 +1,187 @@
+diff --git a/Kabus_gui_v4_1.py b/Kabus_gui_v4_1.py
+--- a/Kabus_gui_v4_1.py
++++ b/Kabus_gui_v4_1.py
+@@ -1,10 +1,12 @@
+ # -*- coding: utf-8 -*-
+ import json, queue, threading, time, datetime as dt, math, statistics
+ from collections import deque
+ import tkinter as tk
+ from tkinter import ttk, filedialog, messagebox
+ 
++# Spoof detector
++from spoofing_plus import SpoofDetector
+ # V3互換スタブ（日本語コメント付き）
+ try:
+     from v4_compat_stubs_ja import CompatV3StubsJA
+@@ -50,6 +52,14 @@
+         self._auto_th = None
+         self._auto_stop = threading.Event()
+         self._auto_lock = threading.Lock()
++        # Spoof detector
++        self.spoof_cfg = {
++            'enabled': True, 'window_ms': 3000, 'buffer_points': 200, 'k_big': 3.5,
++            'min_lifesspan_ms': 80, 'flash_max_ms': 800, 'layer_levels': 5, 'layer_need': 3,
++            'layer_drop_ms': 900, 'walk_window_ms': 1400, 'walk_steps_need': 3,
++            'score_threshold': 0.70, 'suppress_weight': 0.20,
++        }
++        self.spoof = SpoofDetector(self.spoof_cfg)
+ 
+     def _build_tabs(self):
+         tabs = ttk.Notebook(self.root)
+@@ -90,6 +100,13 @@
+ 
+         tab_logs = ttk.Frame(tabs); tabs.add(tab_logs, text="ログ")
+ 
++        # 理由（最新）
++        self.var_reason = tk.StringVar(value="—")
++        lf_reason = ttk.LabelFrame(tab_logs, text="理由（最新）", padding=6, style="Group.TLabelframe")
++        lf_reason.pack(fill="x", padx=6, pady=(6, 0))
++        ttk.Label(lf_reason, textvariable=self.var_reason,
++                  style="Small.TLabel", wraplength=1100, justify="left").pack(anchor="w")
++
+         # 縦スクロール付きのテキスト
+         self.log_box = tkst.ScrolledText(tab_logs, wrap="none", height=12, font=("Consolas", 10))
+         self.log_box.pack(fill="both", expand=True, padx=6, pady=(6,0))
+@@ -120,14 +137,18 @@
+ 
+ 
+         # メトリクス行：Sp/Inv/Imbalance/成行き(1m)
+-        self.var_spread = tk.StringVar(value="Sp: —")     # Spread（円）
+-        self.var_inv    = tk.StringVar(value="Inv: 0")    # ネットポジ
+-        self.var_imbal  = tk.StringVar(value="Imb: —")    # (Bid1Qty-Ask1Qty)/(sum)*100%
++        self.var_spread = tk.StringVar(value="Sp: —")
++        self.var_inv    = tk.StringVar(value="Inv: 0")
++        self.var_imbal  = tk.StringVar(value="Imb: —")
+         self.var_mkt    = tk.StringVar(value="成行: 買0 / 売0 (1m)")
+-        row = ttk.Frame(tab_tape); row.pack(fill="x", padx=6)
+-        ttk.Label(row, textvariable=self.var_spread).pack(side="left", padx=(0,12))
+-        ttk.Label(row, textvariable=self.var_inv).pack(side="left", padx=(0,12))
+-        ttk.Label(row, textvariable=self.var_imbal).pack(side="left", padx=(0,12))
+-        ttk.Label(row, textvariable=self.var_mkt, style="Small.TLabel").pack(side="right")
++        self.metrics_bar = ttk.Frame(tab_tape); self.metrics_bar.pack(fill="x", padx=6)
++        ttk.Label(self.metrics_bar, textvariable=self.var_spread).pack(side="left", padx=(0,12))
++        ttk.Label(self.metrics_bar, textvariable=self.var_inv).pack(side="left", padx=(0,12))
++        ttk.Label(self.metrics_bar, textvariable=self.var_imbal).pack(side="left", padx=(0,12))
++        self.metrics_right = ttk.Frame(self.metrics_bar); self.metrics_right.pack(side="right")
++        # 見せ板バッジ
++        self.lbl_spoof = ttk.Label(self.metrics_right, text="見せ板: なし", width=18, anchor="e")
++        self.lbl_spoof.pack(side="right", padx=(12,0))
++        ttk.Label(self.metrics_right, textvariable=self.var_mkt, style="Small.TLabel").pack(side="right")
+ 
+         # 左右分割：左=歩み値 / 右=ラダー
+         split = ttk.Panedwindow(tab_tape, orient="horizontal")
+@@ -180,25 +201,13 @@
+         self.ladder_cv.bind("<Double-1>",        self._on_canvas_dbl_order)
+         self.ladder_cv.bind("<Double-Button-1>", self._on_canvas_dbl_order)  # X11 対策
+ 
+-        # レイアウト既定（未定義なら）
+-        if not hasattr(self, "_LADDER_ROW_H"):   self._LADDER_ROW_H   = 22
+-        if not hasattr(self, "_LADDER_W_ASKMY"): self._LADDER_W_ASKMY = 60
+-        if not hasattr(self, "_LADDER_W_ASK"):   self._LADDER_W_ASK   = 140
+-
+-    def _on_ladder_resize(self, ev):
+-        try:
+-            # 直近の行で再描画（列幅を現在幅で再計算）
+-            if getattr(self, "_ladder_rows", None):
+-                self._render_ladder(self._ladder_rows)
+-        except Exception as e:
+-            self._log_exc("UI", e)
+-
+-
+-
+-        lf_reason = ttk.LabelFrame(tab_log, text="理由（最新）", padding=6, style="Group.TLabelframe")
+-        lf_reason.pack(fill="x", padx=6, pady=(8, 6))
+-        ttk.Label(lf_reason, text="（見せ板等の理由ログは後で実装）", style="Small.TLabel", wraplength=1100, justify="left").pack(anchor="w")
+-
+-        lf_log = ttk.LabelFrame(tab_log, text="ログ", padding=6, style="Group.TLabelframe")
+-        lf_log.pack(fill="both", expand=True, padx=6, pady=(0, 8))
++        # レイアウト既定（未定義なら）
++        if not hasattr(self, "_LADDER_ROW_H"):   self._LADDER_ROW_H   = 22
++        if not hasattr(self, "_LADDER_W_ASKMY"): self._LADDER_W_ASKMY = 60
++        if not hasattr(self, "_LADDER_W_ASK"):   self._LADDER_W_ASK   = 140
++
++    def _on_ladder_resize(self, ev):
++        try:
++            if getattr(self, "_ladder_rows", None):
++                self._render_ladder(self._ladder_rows)
++        except Exception as e:
++            self._log_exc("UI", e)
+ 
+     # ----------------------------- その他UI要素 -----------------------------
+@@ -420,6 +429,22 @@
+                     try: self.ui_call(self.var_imbal.set, "Imb: —")
+                     except Exception: pass
+             else:
++            # --- 見せ板/アルゴ検出 ---
++            try:
++                import time as _t
++                st = self.spoof.update(
++                    ts_ms=int(_t.time()*1000),
++                    best_bid=bid1p, best_ask=ask1p, best_bidq=bid1q, best_askq=ask1q,
++                    levels={'B': buys, 'S': sells},
++                    last_trade=getattr(self, "last_print", None)
++                )
++                self.lbl_spoof.configure(text=f"見せ板: {self.spoof.format_badge(st)}")
++                if st:
++                    try: self.var_reason.set(self.spoof.reason_enjp(st))
++                    except Exception: pass
++            except Exception as e:
++                self._log_exc("spoof", e)
++
+                 try:
+                     self.ui_call(self.var_spread.set, "Sp: —")
+                     self.ui_call(self.var_imbal.set, "Imb: —")
+@@ -580,6 +605,22 @@
+             ask1p,ask1q = sells[0]
+             self._update_tape_from_l1(getattr(self, "_prev_l1", None), bid1p, bid1q, ask1p, ask1q)
+ 
++            # 見せ板/アルゴ検出（デモ板）
++            try:
++                import time as _t
++                st = self.spoof.update(
++                    ts_ms=int(_t.time()*1000),
++                    best_bid=bid1p, best_ask=ask1p, best_bidq=bid1q, best_askq=ask1q,
++                    levels={'B': buys, 'S': sells},
++                    last_trade=getattr(self, "last_print", None)
++                )
++                self.lbl_spoof.configure(text=f"見せ板: {self.spoof.format_badge(st)}")
++                if st:
++                    try: self.var_reason.set(self.spoof.reason_enjp(st))
++                    except Exception: pass
++            except Exception as e:
++                self._log_exc("spoof", e)
++
+             # Sp/Imbも更新
+             if bid1p is not None and ask1p is not None:
+                 self.var_spread.set(f"Sp: {ask1p - bid1p:,.1f}")
+@@ -710,6 +751,16 @@
+         ts = time.strftime("%H:%M:%S")
+         if not hasattr(self, "tape"): self.tape = []
+         self.tape.append((time.time(), side, int(qty), float(price)))
++        # last_print for spoof/algos detector
++        try:
++            now_sec = time.time()
++            self._last_print_side = ("B" if side == "買成" else "S")
++            self.last_print = {"side": self._last_print_side, "qty": int(qty),
++                               "price": float(price), "ts_ms": int(now_sec*1000)}
++        except Exception:
++            pass
++        if len(self.tape) > 200: self.tape = self.tape[-200:]
++
+         # 表示
+         self.ui_call(self.tree_tape.insert, "", "end", values=(ts, side, int(qty), f"{price:,.1f}"))
+         try: self.ui_call(self.tree_tape.yview_moveto, 1.0)
+@@ -780,6 +831,14 @@
+         now = time.time()
+         if not hasattr(self, "tape"): self.tape = []  # [(ts, side, qty, price)]
+         self.tape.append((now, side, int(qty), float(price)))
++        try:
++            self._last_print_side = ("B" if side == "買成" else "S")
++            self.last_print = {"side": self._last_print_side, "qty": int(qty),
++                               "price": float(price), "ts_ms": int(now*1000)}
++        except Exception:
++            pass
++        if len(self.tape) > 200: self.tape = self.tape[-200:]
++
+         # 200件保つ
+         if len(self.tape) > 200: self.tape = self.tape[-200:]
