@@ -34,6 +34,9 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+# Spoof detector
+from spoofing_plus import SpoofDetector
+
 # V3互換スタブ（日本語コメント付き）
 try:
     from v4_compat_stubs_ja import CompatV3StubsJA
@@ -102,6 +105,17 @@ class App(CompatV3StubsJA, tk.Tk):
         self._auto_th = None
         self._auto_stop = threading.Event()
         self._auto_lock = threading.Lock()
+
+        # Spoof detector
+        self.spoof_cfg = {
+            'enabled': True, 'window_ms': 3000, 'buffer_points': 200, 'k_big': 3.5,
+            'min_lifesspan_ms': 80, 'flash_max_ms': 800, 'layer_levels': 5, 'layer_need': 3,
+            'layer_drop_ms': 900, 'walk_window_ms': 1400, 'walk_steps_need': 3,
+            'score_threshold': 0.70, 'suppress_weight': 0.20,
+        }
+        self.spoof = SpoofDetector(self.spoof_cfg)
+        self._last_print_side = None
+        self.last_print = None
         # AUTO設定（最初に dict を作る！）
         self.auto_cfg = {
             "qty": 100,
@@ -2036,6 +2050,16 @@ class App(CompatV3StubsJA, tk.Tk):
         ts = time.strftime("%H:%M:%S")
         if not hasattr(self, "tape"): self.tape = []
         self.tape.append((time.time(), side, int(qty), float(price)))
+
+        # last_print for spoof/algos detector
+        try:
+            import time as _t
+            now_sec = _t.time()
+            self._last_print_side = ("B" if side == "買成" else "S")
+            self.last_print = {"side": self._last_print_side, "qty": int(qty),
+                               "price": float(price), "ts_ms": int(now_sec*1000)}
+        except Exception:
+            pass
         if len(self.tape) > 200: self.tape = self.tape[-200:]
         # 表示
         self.ui_call(self.tree_tape.insert, "", "end", values=(ts, side, int(qty), f"{price:,.1f}"))
@@ -2198,6 +2222,22 @@ class App(CompatV3StubsJA, tk.Tk):
             ask1p,ask1q = sells[0]
             self._update_tape_from_l1(getattr(self, "_prev_l1", None), bid1p, bid1q, ask1p, ask1q)
 
+
+            # --- 見せ板/アルゴ検出 ---
+            try:
+                import time as _t
+                st = self.spoof.update(
+                    ts_ms=int(_t.time()*1000),
+                    best_bid=bid1p, best_ask=ask1p, best_bidq=bid1q, best_askq=ask1q,
+                    levels={'B': buys, 'S': sells},
+                    last_trade=getattr(self, "last_print", None)
+                )
+                self.lbl_spoof.configure(text=f"見せ板: {self.spoof.format_badge(st)}")
+                if st:
+                    try: self.var_reason.set(self.spoof.reason_enjp(st))
+                    except Exception: pass
+            except Exception as e:
+                self._log_exc("spoof", e)
             # Sp/Imbも更新
             if bid1p is not None and ask1p is not None:
                 self.var_spread.set(f"Sp: {ask1p - bid1p:,.1f}")
@@ -2362,6 +2402,16 @@ class App(CompatV3StubsJA, tk.Tk):
         now = time.time()
         if not hasattr(self, "tape"): self.tape = []  # [(ts, side, qty, price)]
         self.tape.append((now, side, int(qty), float(price)))
+
+        # last_print for spoof/algos detector
+        try:
+            import time as _t
+            now_sec = _t.time()
+            self._last_print_side = ("B" if side == "買成" else "S")
+            self.last_print = {"side": self._last_print_side, "qty": int(qty),
+                               "price": float(price), "ts_ms": int(now_sec*1000)}
+        except Exception:
+            pass
         # 200件保つ
         if len(self.tape) > 200: self.tape = self.tape[-200:]
         # 表示
