@@ -1,0 +1,463 @@
+diff --git a/spoofing_plus.py b/spoofing_plus.py
+new file mode 100644
+index 0000000..e69de29
+--- /dev/null
++++ b/spoofing_plus.py
+@@ -0,0 +1,458 @@
++# -*- coding: utf-8 -*-
++"""
++spoofing_plus.py — spoof/algos detector module (drop-in)
++Public API:
++  d = SpoofDetector(cfg: dict | None)
++  st = d.update(ts_ms, best_bid, best_ask, best_bidq, best_askq, levels=None, last_trade=None) -> dict|None
++  d.format_badge(state_dict) -> str          e.g., "買★★★(layer)"
++  d.reason_enjp(state_dict) -> str           bilingual reason "EN ... / 日本語"
++  d.apply_gate(proposed_side, entry_conf) -> (allow, adj_conf, reason)
++  d.get_log_fields() -> dict                 training-friendly snapshot of last state
++  d.update_config(**kwargs)                  live-tweak thresholds
++"""
++from __future__ import annotations
++from dataclasses import dataclass
++from collections import deque
++from typing import Optional, List, Tuple, Dict, Deque
++import math
++import time
++
++_DEF_CFG = dict(
++    enabled=True,
++    window_ms=3000,           # ring buffer horizon (ms)
++    buffer_points=200,        # max snapshots retained
++    k_big=3.5,                # big order threshold (x rolling mean size on that side)
++    min_lifesspan_ms=80,      # ignore super-noise (< this)
++    flash_max_ms=800,         # flash: visible < 800ms
++    layer_levels=5,           # depth levels considered per side
++    layer_need=3,             # >= this many heavy levels stacked
++    layer_drop_ms=900,        # stacked levels vanish together within this
++    walk_window_ms=1400,      # look-back window for step-back detection
++    walk_steps_need=3,        # need >= 3 outward steps
++    score_threshold=0.70,     # AUTO gate threshold
++    suppress_weight=0.20,     # confidence reduction weight below threshold
++
++    # TWAP-like slicing
++    twap_min_runs=5,
++    twap_cv_t=0.35,
++    twap_cv_q=0.40,
++    twap_max_span_ms=120000,
++
++    # Iceberg / Refresh
++    ice_replenish_ms=400,
++    ice_min_hits=3,
++    ice_price_eps=0.1,
++
++    # Relocation (step move of wall)
++    reloc_window_ms=2000,
++    reloc_steps_need=3,
++    reloc_min_step=0.1,
++
++    # Flip (cancel -> opposite hit)
++    flip_window_ms=600,
++    flip_drop_k=2.0,
++    flip_follow_ms=300,
++
++    # Momentum ignition
++    ignite_window_ms=800,
++    ignite_min_hits=4,
++    ignite_min_dvdt=0.05,
++)
++
++@dataclass
++class Snapshot:
++    t: int
++    bid: float
++    ask: float
++    bq: float
++    aq: float
++    levels_b: Optional[List[Tuple[float, float]]] = None  # [(price, qty), ...] best -> deeper
++    levels_a: Optional[List[Tuple[float, float]]] = None
++    last_print_side: Optional[str] = None  # 'B' or 'S'
++
++@dataclass
++class State:
++    side: str                 # 'B' or 'S' (where spoof suspected)
++    type: str                 # 'flash'|'layer'|'walk'|'ping'|'twap'|'iceberg'|'reloc'|'flip'|'ignite'
++    score: float
++    age_ms: int
++    peak_size: float
++
++class SpoofDetector:
++    def __init__(self, cfg: Optional[Dict] = None):
++        self.cfg = {**_DEF_CFG, **(cfg or {})}
++        self.buf: Deque[Snapshot] = deque(maxlen=self.cfg['buffer_points'])
++        self._cand: Dict[str, Optional[Dict]] = {'B': None, 'S': None}
++        self._steps: Deque[Tuple[int, str, float]] = deque(maxlen=16)  # (t, side, best_price)
++        self._last_state: Optional[State] = None
++        self.trades: Deque[Dict] = deque(maxlen=256)  # {'t','side','qty','px'}
++        self._last_trade_sig = None
++
++    # ---------------- public API ----------------
++    def update(self, ts_ms: int, best_bid: float, best_ask: float, best_bidq: float, best_askq: float,
++               levels: Optional[Dict[str, List[Tuple[float, float]]]] = None,
++               last_trade: Optional[Dict] = None) -> Optional[Dict]:
++        if not self.cfg.get('enabled', True):
++            return None
++        snap = Snapshot(
++            t=int(ts_ms), bid=float(best_bid or 0), ask=float(best_ask or 0),
++            bq=float(best_bidq or 0), aq=float(best_askq or 0),
++            levels_b=(levels or {}).get('B'), levels_a=(levels or {}).get('S'),
++            last_print_side=(last_trade or {}).get('side')
++        )
++        self.buf.append(snap)
++
++        # harvest last_trade (dedup)
++        lt = last_trade or {}
++        sig = (lt.get('side'), lt.get('qty'), lt.get('price') or lt.get('px'), lt.get('ts_ms'))
++        if lt.get('side'):
++            if sig != self._last_trade_sig:
++                self.trades.append({
++                    't': lt.get('ts_ms', ts_ms),
++                    'side': lt.get('side'),
++                    'qty': lt.get('qty'),
++                    'px': lt.get('price') or lt.get('px')
++                })
++                self._last_trade_sig = sig
++
++        # signals
++        s_flash = self._detect_flash(snap)
++        s_layer = self._detect_layer(snap)
++        s_walk  = self._detect_walk(snap)
++        s_ping  = self._detect_ping(snap)
++        s_twap  = self._detect_twap(snap.t)
++        s_ice   = self._detect_iceberg(snap)
++        s_reloc = self._detect_relocation(snap)
++        s_flip  = self._detect_flip(snap)
++        s_ignite= self._detect_ignite(snap)
++
++        best = max([s for s in (s_flash, s_layer, s_walk, s_ping, s_twap, s_ice, s_reloc, s_flip, s_ignite) if s],
++                   key=lambda x: x.score, default=None)
++        self._last_state = best
++        return self._state_to_dict(best) if best else None
++
++    def format_badge(self, state: Optional[Dict]) -> str:
++        if not state:
++            return "なし"
++        side = '買' if state['side'] == 'B' else '売'
++        star = self._stars(state['score'])
++        return f"{side}{star}({state['type']})"
++
++    def reason_enjp(self, state: Optional[Dict]) -> str:
++        """Return bilingual reason line for UI/log. Accepts dict (update() result)."""
++        if not state:
++            return ""
++        ty = state.get('type')
++        side = "BUY" if state.get('side')=='B' else "SELL"
++        parts = {
++            'flash':   ("Flash spoof", "瞬間消し見せ板"),
++            'layer':   ("Layering", "レイヤリング"),
++            'walk':    ("Quote retreat", "最良逃げ"),
++            'ping':    ("Ping spoof", "ピン（当たり探り）"),
++            'twap':    ("TWAP-like slicing", "等時間スライス"),
++            'iceberg': ("Iceberg refresh", "アイスバーグ"),
++            'reloc':   ("Relocation step spoof", "段階移動"),
++            'flip':    ("Flip spoof", "取消→反対側ヒット"),
++            'ignite':  ("Momentum ignition", "点火"),
++        }.get(ty, (ty, ty))
++        if isinstance(parts, tuple):
++            en, ja = parts
++        else:
++            en = ja = str(ty)
++        extra = f" side={side} score={state.get('score',0):.2f} age={state.get('age_ms',0)}ms"
++        return f"{en}{extra} / {ja}"
++
++    def apply_gate(self, proposed_side: str, entry_confidence: float) -> Tuple[bool, float, str]:
++        s = self._last_state
++        if not s:
++            return True, entry_confidence, ''
++        thr = self.cfg['score_threshold']
++        reason = ''
++        allow = True
++        adj = entry_confidence
++        # strict: same side & over threshold
++        if s.score >= thr and ((proposed_side or '') == s.side):
++            allow = False
++            reason = self.reason_enjp(self._state_to_dict(s)) + f" (>= {thr:.2f})"
++        else:
++            # soft penalty
++            adj = max(0.0, entry_confidence - self.cfg['suppress_weight'] * s.score)
++            reason = self.reason_enjp(self._state_to_dict(s)) + f" → conf {entry_confidence:.2f}→{adj:.2f}"
++        return allow, adj, reason
++
++    def get_log_fields(self) -> Dict:
++        s = self._last_state
++        if not s:
++            return {"spoof_side":"", "spoof_type":"", "spoof_score":"", "spoof_age_ms":"", "spoof_peak_size":""}
++        return {
++            "spoof_side": 'B' if s.side=='B' else 'S',
++            "spoof_type": s.type,
++            "spoof_score": round(float(s.score), 3),
++            "spoof_age_ms": int(s.age_ms),
++            "spoof_peak_size": float(s.peak_size or 0),
++        }
++
++    def update_config(self, **kwargs):
++        self.cfg.update(kwargs)
++        self.buf = deque(self.buf, maxlen=self.cfg['buffer_points'])
++
++    # --------------- helpers / classic detectors ---------------
++    def _stars(self, score: float) -> str:
++        s = max(0.0, min(0.999, float(score or 0.0)))
++        n = max(1, min(5, int(round(s*5/1.0))))
++        return "★"*n + "☆"*(5-n)
++
++    def _rolling_mean_sizes(self, ms: int) -> Tuple[float, float]:
++        if not self.buf:
++            return 0.0, 0.0
++        t_now = self.buf[-1].t
++        bsz = [s.bq for s in self.buf if (t_now - s.t) <= ms]
++        asz = [s.aq for s in self.buf if (t_now - s.t) <= ms]
++        def mean(x):
++            return sum(x)/len(x) if x else 0.0
++        return mean(bsz), mean(asz)
++
++    def _detect_flash(self, snap: Snapshot) -> Optional[State]:
++        # lifecycle per side: when a very large best appears briefly then vanishes
++        out = None
++        for side in ('B', 'S'):
++            price = snap.bid if side=='B' else snap.ask
++            size  = snap.bq if side=='B' else snap.aq
++            avg_b, avg_a = self._rolling_mean_sizes(self.cfg['window_ms'])
++            avg = avg_b if side=='B' else avg_a
++            t = snap.t
++            eps = 1e-9
++            cand = self._cand.get(side)
++            heavy = size >= self.cfg['k_big'] * max(1.0, avg)
++            if heavy and not cand:
++                self._cand[side] = dict(start=t, peak=size, last=size, price=price)
++            elif cand:
++                cand['peak'] = max(cand['peak'], size)
++                dropped = (size < 0.5 * max(1.0, avg)) or (price != cand.get('price'))
++                timeout = (t - cand['start']) > self.cfg['flash_max_ms']
++                if dropped or timeout:
++                    life = max(1, t - cand['start'])
++                    if life >= self.cfg['min_lifesspan_ms'] and life <= self.cfg['flash_max_ms'] and dropped:
++                        rel = float(cand['peak']) / max(avg, eps)
++                        life_fac = max(0.0, 1.0 - (life / self.cfg['flash_max_ms']))
++                        score = math.tanh(0.35 * rel) * life_fac
++                        out = State(side=side, type='flash', score=float(score), age_ms=int(life), peak_size=float(cand['peak']))
++                    self._cand[side] = None
++        return out
++
++    def _detect_layer(self, snap: Snapshot) -> Optional[State]:
++        lb = snap.levels_b or []
++        la = snap.levels_a or []
++        if not lb and not la:
++            return None
++        def stack_score(levels: List[Tuple[float, float]]) -> Tuple[int, float]:
++            qtys = [q for _, q in levels[: self.cfg['layer_levels']]]
++            if not qtys:
++                return 0, 0.0
++            base = (sum(qtys)/len(qtys)) or 1.0
++            heavy = [q for _, q in levels[: self.cfg['layer_levels']] if q >= self.cfg['k_big'] * base]
++            return len(heavy), base
++        nb, base_b = stack_score(lb)
++        na, base_a = stack_score(la)
++        # stacked then collectively drop as we approach
++        out=None
++        if nb >= self.cfg['layer_need']:
++            out = State(side='B', type='layer', score=min(0.95, 0.55 + 0.1*nb), age_ms=0, peak_size=base_b)
++        if na >= self.cfg['layer_need']:
++            st2 = State(side='S', type='layer', score=min(0.95, 0.55 + 0.1*na), age_ms=0, peak_size=base_a)
++            if (out is None) or (st2.score > out.score):
++                out = st2
++        return out
++
++    def _detect_walk(self, snap: Snapshot) -> Optional[State]:
++        # track best changes
++        t = snap.t
++        self._steps.append((t, 'B', snap.bid))
++        self._steps.append((t, 'S', snap.ask))
++        if len(self._steps) < 6:
++            return None
++        window = self.cfg['walk_window_ms']
++        steps_b = [p for (ts, side, p) in self._steps if side=='B' and (t - ts) <= window]
++        steps_s = [p for (ts, side, p) in self._steps if side=='S' and (t - ts) <= window]
++        out=None
++        def count_outward(seq, outward='down'):
++            cnt=0
++            for i in range(1, len(seq)):
++                if outward=='down' and seq[i] < seq[i-1]:
++                    cnt += 1
++                if outward=='up' and seq[i] > seq[i-1]:
++                    cnt += 1
++            return cnt
++        if len(steps_b) >= 4:
++            cnt = count_outward(steps_b[-6:], outward='down')
++            if cnt >= self.cfg['walk_steps_need']:
++                score = min(1.0, 0.2 * cnt)
++                out = State(side='B', type='walk', score=score, age_ms=self.cfg['walk_window_ms'], peak_size=snap.bq)
++        if len(steps_s) >= 4:
++            cnt = count_outward(steps_s[-6:], outward='up')
++            sc2 = min(1.0, 0.2 * cnt)
++            st2 = State(side='S', type='walk', score=sc2, age_ms=self.cfg['walk_window_ms'], peak_size=snap.aq)
++            if (out is None) or (st2.score > out.score):
++                out = st2
++        return out
++
++    def _detect_ping(self, snap: Snapshot) -> Optional[State]:
++        # best-effort heuristic: big best appears briefly, last print opposite, then cancel
++        if len(self.buf) < 3:
++            return None
++        a = self.buf[-1]; b = self.buf[-2]; c = self.buf[-3]
++        # Opposite last print
++        opp = a.last_print_side and (a.last_print_side in ('B','S'))
++        if not opp:
++            return None
++        # quick appear/disappear near best
++        avg_b, avg_a = self._rolling_mean_sizes(self.cfg['window_ms'])
++        big_b = b.bq >= self.cfg['k_big'] * max(1.0, avg_b)
++        big_a = b.aq >= self.cfg['k_big'] * max(1.0, avg_a)
++        # disappeared now?
++        drop_b = a.bq < 0.5 * max(1.0, avg_b)
++        drop_a = a.aq < 0.5 * max(1.0, avg_a)
++        if big_b and drop_b and a.last_print_side=='S':
++            return State(side='B', type='ping', score=0.6, age_ms=a.t-b.t, peak_size=b.bq)
++        if big_a and drop_a and a.last_print_side=='B':
++            return State(side='S', type='ping', score=0.6, age_ms=a.t-b.t, peak_size=b.aq)
++        return None
++
++    # --------------- new detectors ---------------
++    def _detect_twap(self, now_ms: int) -> Optional[State]:
++        span = self.cfg.get('twap_max_span_ms', 120000)
++        need = self.cfg.get('twap_min_runs', 5)
++        cv_t_max = self.cfg.get('twap_cv_t', 0.35)
++        cv_q_max = self.cfg.get('twap_cv_q', 0.40)
++        tr = [t for t in self.trades if (now_ms - t['t']) <= span]
++        if len(tr) < need: return None
++        side = max(('B','S'), key=lambda s: sum(1 for x in tr if x['side']==s))
++        seq = [x for x in tr if x['side']==side]
++        if len(seq) < need: return None
++        dts = [seq[i]['t']-seq[i-1]['t'] for i in range(1, len(seq)) if seq[i]['t']>seq[i-1]['t']]
++        if not dts: return None
++        try:
++            import statistics
++            mean_dt = sum(dts)/len(dts)
++            cv_t = (statistics.pstdev(dts)/mean_dt) if mean_dt>0 else 1.0
++        except Exception:
++            cv_t = 1.0
++        if cv_t > cv_t_max: return None
++        qtys = [x.get('qty') for x in seq if x.get('qty')]
++        if qtys and len(qtys)>=3:
++            mean_q = sum(qtys)/len(qtys)
++            try:
++                import statistics
++                cv_q = (statistics.pstdev(qtys)/mean_q) if mean_q>0 else 0.0
++            except Exception:
++                cv_q = 0.0
++            if cv_q > cv_q_max: return None
++        runs = len(seq)
++        score = min(0.95, 0.5*(1.0-cv_t) + 0.1*min(1.0, runs/12) + (0.4*(1.0-(cv_q if qtys else 0.0))))
++        t_last = seq[-1]['t']; peak = max(qtys) if qtys else 0.0
++        return State(side=side, type='twap', score=score, age_ms=now_ms - t_last, peak_size=peak)
++
++    def _detect_iceberg(self, snap: Snapshot) -> Optional[State]:
++        buf = list(self.buf)
++        if len(buf) < 4: return None
++        eps = self.cfg.get('ice_price_eps', 0.1)
++        rep_ms = self.cfg.get('ice_replenish_ms', 400)
++        need = self.cfg.get('ice_min_hits', 3)
++        def count(side):
++            hits=0; last_ts=None
++            for i in range(len(buf)-2, 1, -1):
++                a,b = buf[i+1], buf[i]
++                if side=='S':
++                    same = abs(a.ask-b.ask) <= eps; drop = a.aq < b.aq
++                    if same and drop:
++                        t0=b.t
++                        for j in range(i-1, max(i-6,-1), -1):
++                            if buf[j].t < t0 - rep_ms: break
++                            if buf[j].ask==b.ask and buf[j].aq >= b.aq:
++                                hits+=1; last_ts=buf[j].t; break
++                else:
++                    same = abs(a.bid-b.bid) <= eps; drop = a.bq < b.bq
++                    if same and drop:
++                        t0=b.t
++                        for j in range(i-1, max(i-6,-1), -1):
++                            if buf[j].t < t0 - rep_ms: break
++                            if buf[j].bid==b.bid and buf[j].bq >= b.bq:
++                                hits+=1; last_ts=buf[j].t; break
++            return hits, last_ts
++        hs,ts = count('S'); hb,tb = count('B')
++        if hs>=need or hb>=need:
++            if hs>=hb:
++                return State(side='S', type='iceberg', score=min(0.95, 0.6+0.1*hs), age_ms=snap.t-(ts or snap.t), peak_size=snap.aq)
++            else:
++                return State(side='B', type='iceberg', score=min(0.95, 0.6+0.1*hb), age_ms=snap.t-(tb or snap.t), peak_size=snap.bq)
++        return None
++
++    def _detect_relocation(self, snap: Snapshot) -> Optional[State]:
++        win = self.cfg.get('reloc_window_ms', 2000)
++        need = self.cfg.get('reloc_steps_need', 3)
++        min_step = self.cfg.get('reloc_min_step', 0.1)
++        buf = [s for s in self.buf if (snap.t - s.t) <= win]
++        if len(buf) < need+1: return None
++        steps_s=0; steps_b=0
++        for i in range(1,len(buf)):
++            if buf[i].ask - buf[i-1].ask >= min_step: steps_s += 1
++        for i in range(1,len(buf)):
++            if buf[i-1].bid - buf[i].bid >= min_step: steps_b += 1
++        def stacked(levels):
++            if not levels: return False
++            qtys=[q for _,q in levels[: self.cfg['layer_levels']]]
++            if not qtys: return False
++            base=(sum(qtys)/len(qtys)) or 1.0
++            heavy=[q for _,q in levels[: self.cfg['layer_levels']] if q >= self.cfg['k_big']*base]
++            return len(heavy) >= max(1, self.cfg.get('layer_need',3)-1)
++        side=None
++        if steps_s>=need and stacked(snap.levels_a): side='S'
++        elif steps_b>=need and stacked(snap.levels_b): side='B'
++        if not side: return None
++        score = min(0.9, 0.2*max(steps_s,steps_b) + 0.7)
++        peak = (snap.aq if side=='S' else snap.bq)
++        return State(side=side, type='reloc', score=score, age_ms=0, peak_size=peak)
++
++    def _detect_flip(self, snap: Snapshot) -> Optional[State]:
++        win = self.cfg.get('flip_window_ms', 600)
++        follow = self.cfg.get('flip_follow_ms', 300)
++        dropk = self.cfg.get('flip_drop_k', 2.0)
++        if len(self.buf) < 2: return None
++        a=self.buf[-1]; b=self.buf[-2]
++        avg_b,avg_a = self._rolling_mean_sizes(self.cfg['window_ms'])
++        big_drop_s = (b.aq - a.aq) > dropk*max(1.0, avg_a) and a.ask >= b.ask
++        big_drop_b = (b.bq - a.bq) > dropk*max(1.0, avg_b) and a.bid <= b.bid
++        if not (big_drop_s or big_drop_b): return None
++        tr = [t for t in self.trades if (snap.t - t['t']) <= follow]
++        if not tr: return None
++        opp=None
++        if big_drop_s and any(t['side']=='B' for t in tr): opp='S'
++        if big_drop_b and any(t['side']=='S' for t in tr): opp='B'
++        if not opp: return None
++        score=0.75; peak=(a.aq if big_drop_s else a.bq)
++        return State(side=opp, type='flip', score=score, age_ms=0, peak_size=peak)
++
++    def _detect_ignite(self, snap: Snapshot) -> Optional[State]:
++        win = self.cfg.get('ignite_window_ms', 800)
++        min_hits = self.cfg.get('ignite_min_hits', 4)
++        min_dvdt = self.cfg.get('ignite_min_dvdt', 0.05)
++        buf = [s for s in self.buf if (snap.t - s.t) <= win]
++        if len(buf) < 3: return None
++        dp = (buf[-1].ask+buf[-1].bid)/2 - (buf[0].ask+buf[0].bid)/2
++        dt = (buf[-1].t - buf[0].t)/1000.0 if (buf[-1].t - buf[0].t)>0 else 1.0
++        v = abs(dp/dt)
++        if v < min_dvdt: return None
++        hitsB = sum(1 for t in self.trades if (snap.t - t['t']) <= win and t['side']=='B')
++        hitsS = sum(1 for t in self.trades if (snap.t - t['t']) <= win and t['side']=='S')
++        if max(hitsB, hitsS) < min_hits: return None
++        side = 'B' if hitsB>=hitsS else 'S'
++        score = min(0.95, 0.6 + 0.05*max(hitsB, hitsS))
++        peak = (snap.aq if side=='S' else snap.bq)
++        return State(side=side, type='ignite', score=score, age_ms=buf[-1].t-buf[0].t, peak_size=peak)
++
++    # ---- utils ----
++    def _state_to_dict(self, s: Optional[State]) -> Optional[Dict]:
++        if not s:
++            return None
++        return dict(side=s.side, type=s.type, score=float(s.score), age_ms=int(s.age_ms), peak_size=float(s.peak_size or 0))

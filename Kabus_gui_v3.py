@@ -441,6 +441,24 @@ class App(tk.Tk):
         # ログ抑制
         self._log_memo: Dict[str,float] = {}
 
+        # ----- DBG -----
+        # === ここから貼付：UIコールバックの最低限スタブを生やす ===
+        from tkinter import messagebox as _mb
+        def _stub_factory(_name, _title):
+            def _stub(*a, **k):
+                _mb.showinfo(_title, f"{_title} はこのビルドでは未実装です（{_name}）。")
+            return _stub
+
+        # UIが参照する可能性のあるコールバック名を網羅
+        for _name, _title in [
+            ("_open_help", "使い方 / HELP"),
+            ("start_scan", "スクリーニング開始"),
+            ("stop_scan",  "スクリーニング停止"),
+            ("set_main_from_scan_selection", "スキャン結果をメインへ反映"),
+            ("update_preset_names", "プリセット名の更新"),
+        ]:
+            if not hasattr(self, _name):
+                setattr(self, _name, _stub_factory(_name, _title))
         # ===== UI構築 =====
         self._build_ui()
         self._layout()
@@ -1411,8 +1429,8 @@ class App(tk.Tk):
         self.main_nb.add(self.tab_hist, text="SIM履歴")
 
         # ショートカット（任意）
-        self.bind_all("<F9>",  lambda e: self.export_sim_history_csv())
-        self.bind_all("<F10>", lambda e: self.export_sim_history_xlsx())
+        #self.bind_all("<F9>",  lambda e: self.export_sim_history_csv())
+        #self.bind_all("<F10>", lambda e: self.export_sim_history_xlsx())
 
         # LIVE履歴
         self.tab_live = ttk.Frame(self.main_nb)
@@ -4258,103 +4276,317 @@ class App(tk.Tk):
     def start_training_log(self):
         """
         学習ログを開始。
-        - 既存の保存場所（scalper/sim_logs/features/YYYYMMDD/<symbol>.csv）を維持
-        - 既存ファイルが v1 ヘッダ（ts,symbol,side_hint,...）なら <symbol>.v2.csv に切替
-        - 新規/空ファイルのときだけヘッダを1回書く
+        - 保存先: scalper/sim_logs/features/YYYYMMDD/<symbol>.v3.csv
+        - ヘッダ: ts,symbol,side,last,tick_size,tp_ticks,sl_ticks,label,skip_reason + FEATURE_COLUMNS + pushes_per_min
+        - 既存の古いCSV(v1/v2)は残し、新規に v3 を作る
         """
         if not _ML_AVAILABLE:
-            self._log("TRAIN", "ml-disabled"); return
+            self._log("TRAIN", "ml-disabled")
+            return
 
-        import csv, os
+        import csv
         from pathlib import Path
         import datetime as dt
+        import scalper
+        from scalper.ml.features import FEATURE_COLUMNS
 
         base = Path(scalper.__file__).resolve().parent / "sim_logs" / "features"
         day = dt.datetime.now().strftime("%Y%m%d")
         out_dir = base / day
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        sym = self.symbol.get().strip()
-        path = out_dir / f"{sym}.csv"
+        try:
+            sym = (self.symbol.get() or "").strip()
+        except Exception:
+            sym = (getattr(self, "current_symbol", "") or "").strip()
+        if not sym:
+            self._log("TRAIN", "symbol empty; abort start_training_log")
+            return
 
-        # 既存が v1 ヘッダ（ts,symbol,side_hint,...) なら v2 へ移行
-        use_v2_path = False
-        if path.exists():
-            try:
-                with open(path, "r", encoding="utf-8") as rf:
-                    first_line = rf.readline().strip()
-                if first_line.startswith("ts,symbol,side_hint"):
-                    use_v2_path = True
-            except Exception:
-                pass
-        if use_v2_path:
-            path = out_dir / f"{sym}.v2.csv"
+        path = out_dir / f"{sym}.v3.csv"
+
+        # ヘッダ定義（順序固定）
+        base_cols = ["ts","symbol","side","last","tick_size","tp_ticks","sl_ticks","label","skip_reason"]
+        # FEATURE_COLUMNS は外部定義。重複を避ける
+        feat_cols = [c for c in FEATURE_COLUMNS if c not in base_cols]
+        self._train_header = base_cols + feat_cols + ["pushes_per_min"]
 
         is_new_file = (not path.exists())
 
         # 追記オープン
         self.train_f = open(path, "a", newline="", encoding="utf-8")
-        self.train_writer = csv.writer(self.train_f)
         self.train_csv_path = str(path)
+        self.train_writer = None  # Lazy init after header check
 
         # 空ファイルのときだけヘッダを1回書く
         if is_new_file or self.train_f.tell() == 0:
-            header = ["ts","symbol","side","label","skip_reason","tp_ticks","sl_ticks"] \
-                    + list(FEATURE_COLUMNS) + ["pushes_per_min"]
-            self.train_writer.writerow(header)
-            try: self.train_f.flush()
-            except Exception: pass
+            self.train_writer = csv.DictWriter(self.train_f, fieldnames=self._train_header)
+            self.train_writer.writeheader()
+            try:
+                self.train_f.flush()
+            except Exception:
+                pass
+        else:
+            # 既存の先頭行が正しいかを確認し、DictWriterをセット
+            import io
+            pos = self.train_f.tell()
+            try:
+                with open(path, "r", encoding="utf-8") as rf:
+                    header_line = rf.readline().strip()
+                # 問題あっても継続
+            except Exception:
+                pass
+            self.train_writer = csv.DictWriter(self.train_f, fieldnames=self._train_header)
 
         self._log("TRAIN", f"開始: {path}")
 
 
-    def stop_training_log(self):
-        if getattr(self, "train_f", None):
-            try: self.train_f.flush()
-            except Exception: pass
-            try: self.train_f.close()
-            except Exception: pass
-            self.train_f = None
-            self.train_writer = None
-            self._log("TRAIN", "停止")
-
-    def _log_training_row(self, side_hint: str = "", label: int = 0, skip_reason: str = None):
+    def start_training_log(self):
         """
-        学習ログ1行をCSVに書く。
-        side_hint : "BUY"/"SELL" or ""（SKIP時は空）
-        label     : 1=ENTER, 0=SKIP
-        skip_reason : 見送り理由（ENTER時は "" 推奨）。None の場合は _trace_buf から WHY: を自動抽出（emit_trace 前に呼ぶこと）。
+        学習ログを開始。
+        - 保存先: scalper/sim_logs/features/YYYYMMDD/<symbol>.v3.csv
+        - ヘッダ: ts,symbol,side,last,tick_size,tp_ticks,sl_ticks,label,skip_reason + FEATURE_COLUMNS + pushes_per_min
+        - 既存の古いCSV(v1/v2)は残し、新規に v3 を作る
         """
-        if not getattr(self, "train_writer", None):
+        if not _ML_AVAILABLE:
+            self._log("TRAIN", "ml-disabled")
             return
 
+        import csv
+        from pathlib import Path
+        import datetime as dt
+        import scalper
+        from scalper.ml.features import FEATURE_COLUMNS
+
+        base = Path(scalper.__file__).resolve().parent / "sim_logs" / "features"
+        day = dt.datetime.now().strftime("%Y%m%d")
+        out_dir = base / day
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            sym = (self.symbol.get() or "").strip()
+        except Exception:
+            sym = (getattr(self, "current_symbol", "") or "").strip()
+        if not sym:
+            self._log("TRAIN", "symbol empty; abort start_training_log")
+            return
+
+        path = out_dir / f"{sym}.v3.csv"
+
+        # ヘッダ定義（順序固定）
+        base_cols = ["ts","symbol","side","last","tick_size","tp_ticks","sl_ticks","label","skip_reason"]
+        # FEATURE_COLUMNS は外部定義。重複を避ける
+        feat_cols = [c for c in FEATURE_COLUMNS if c not in base_cols]
+        self._train_header = base_cols + feat_cols + ["pushes_per_min"]
+
+        is_new_file = (not path.exists())
+
+        # 追記オープン
+        self.train_f = open(path, "a", newline="", encoding="utf-8")
+        self.train_csv_path = str(path)
+        self.train_writer = None  # Lazy init after header check
+
+        # 空ファイルのときだけヘッダを1回書く
+        if is_new_file or self.train_f.tell() == 0:
+            self.train_writer = csv.DictWriter(self.train_f, fieldnames=self._train_header)
+            self.train_writer.writeheader()
+            try:
+                self.train_f.flush()
+            except Exception:
+                pass
+        else:
+            # 既存の先頭行が正しいかを確認し、DictWriterをセット
+            import io
+            pos = self.train_f.tell()
+            try:
+                with open(path, "r", encoding="utf-8") as rf:
+                    header_line = rf.readline().strip()
+                # 問題あっても継続
+            except Exception:
+                pass
+            self.train_writer = csv.DictWriter(self.train_f, fieldnames=self._train_header)
+
+        self._log("TRAIN", f"開始: {path}")
+
+
+    def write_training_row(self, *, side, tp_ticks, sl_ticks, label=1, skip_reason=""):
+        """
+        学習1行を追記します。
+        - side: "BUY" / "SELL"（日本語/略記でも可）
+        - tp_ticks/sl_ticks: int（tick数）
+        - label: 1=ENTER採用, 0=SKIP（ゲート学習用に任意）
+        - skip_reason: SKIP理由（任意）
+        FEATURE_COLUMNS は getattr(self, <col>) から取得（無ければ 0.0）
+        """
+        if not hasattr(self, "train_f") or self.train_f is None:
+            self._log("TRAIN", "not started; call start_training_log() first")
+            return
+        if self.train_f.closed:
+            self._log("TRAIN", "file already closed")
+            return
+
+        import datetime as dt
+        import math
+        from scalper.ml.features import FEATURE_COLUMNS
+
+        # --- 必須値の取得 ---
+        # ts
+        ts = dt.datetime.now().isoformat(timespec="seconds")
+
+        # symbol
+        try:
+            sym = (self.symbol.get() or "").strip()
+        except Exception:
+            sym = (getattr(self, "current_symbol", "") or "").strip()
+
+        # side 正規化
+        s = str(side).strip().upper()
+        side_norm = {"買":"BUY","売":"SELL","B":"BUY","S":"SELL","LONG":"BUY","SHORT":"SELL"}.get(s, s)
+        if side_norm not in ("BUY","SELL"):
+            self._log("TRAIN", f"invalid side '{side}'; skip write")
+            return
+
+        # last（無ければスナップショットでフォールバック）
+        last = getattr(self, "last_price", None)
+        if last is None:
+            try:
+                self._snapshot_symbol_once()
+                last = getattr(self, "last_price", None)
+            except Exception:
+                last = None
+        if last is None:
+            self._log("TRAIN", "last_price None; skip write")
+            return
+
+        # tick_size（GUIが持つ値を優先、無ければ0.5）
+        try:
+            tick_size = float(getattr(self, "tick_size", 0.5) or 0.5)
+        except Exception:
+            tick_size = 0.5
+
+        # tp/sl
+        try:
+            tp_i = int(tp_ticks)
+            sl_i = int(sl_ticks)
+        except Exception:
+            self._log("TRAIN", f"invalid ticks tp={tp_ticks} sl={sl_ticks}; skip write")
+            return
+
+        # --- FEATURE_COLUMNS の吸い上げ ---
+        row = {}
+        for c in FEATURE_COLUMNS:
+            if c in ("ts","symbol","side","last","tick_size","tp_ticks","sl_ticks","label","skip_reason","pushes_per_min"):
+                # 予約カラムはここで埋める
+                continue
+            val = getattr(self, c, None)
+            # ブーリアンは 0/1 に、None/NaN は 0.0 に
+            if isinstance(val, bool):
+                row[c] = 1.0 if val else 0.0
+            elif val is None:
+                row[c] = 0.0
+            else:
+                try:
+                    v = float(val)
+                    if math.isnan(v) or math.isinf(v):
+                        v = 0.0
+                    row[c] = v
+                except Exception:
+                    # 文字列等は 0.0
+                    row[c] = 0.0
+
+        # pushes_per_min（あれば使う。無ければ空）
+        ppm = None
+        try:
+            ppm = float(getattr(self, "pushes_per_min", None))  # あなたの実装に合わせる
+        except Exception:
+            ppm = None
+
+        # --- 予約カラムの設定 ---
+        base = {
+            "ts": ts,
+            "symbol": sym,
+            "side": side_norm,
+            "last": float(last),
+            "tick_size": float(tick_size),
+            "tp_ticks": int(tp_i),
+            "sl_ticks": int(sl_i),
+            "label": int(label),
+            "skip_reason": str(skip_reason or ""),
+            "pushes_per_min": ("" if ppm is None else ppm),
+        }
+
+        # 行の完成（ヘッダ順に並ぶよう DictWriter に任せる）
+        out = {**base, **row}
+
+        try:
+            self.train_writer.writerow(out)
+            # こまめに flush。I/Oが重い場合はバッファでもOK
+            self.train_f.flush()
+        except Exception as e:
+            self._log("TRAIN", f"write_training_row error: {e}")
+
+
+    def stop_training_log(self):
+        """学習ログを終了（ファイルクローズ）。"""
+        try:
+            if hasattr(self, "train_f") and self.train_f and (not self.train_f.closed):
+                self.train_f.flush()
+                self.train_f.close()
+                self._log("TRAIN", f"終了: {self.train_csv_path}")
+        except Exception:
+            pass
+        finally:
+            try:
+                self.train_f = None
+                self.train_writer = None
+            except Exception:
+                pass
+
+
+    def _log_training_row(self, side_hint: str = "", label: int = 0, skip_reason: str | None = None):
+        """
+        学習ログ1行(v3)をCSVに書く（DictWriter）。
+        - ヘッダは start_training_log() の v3: 
+        ["ts","symbol","side","last","tick_size","tp_ticks","sl_ticks","label","skip_reason"] 
+        + FEATURE_COLUMNS + ["pushes_per_min"]
+        - side_hint : "BUY"/"SELL" or ""（SKIP時は空でも可）
+        - label     : 1=ENTER, 0=SKIP（ゲート学習用）
+        - skip_reason : None の場合は TRACE から WHY: を1件抽出
+        """
+        # ファイル未開始なら何もしない
+        if not getattr(self, "train_writer", None) or not getattr(self, "train_f", None) or self.train_f.closed:
+            return
+
+        import datetime as dt, math
+        from scalper.ml.features import FEATURE_COLUMNS
+        # あれば使う（任意）：あなたの既存の特徴量計算
+        try:
+            feats = compute_features(
+                symbol=(self.symbol.get() or "").strip(),
+                last_price=getattr(self, "last_price", None),
+                best_bid=getattr(self, "best_bid", None),
+                best_ask=getattr(self, "best_ask", None),
+                bid_qty=getattr(self, "bid_qty", None),
+                ask_qty=getattr(self, "ask_qty", None),
+                asks=getattr(self, "asks", None),
+                bids=getattr(self, "bids", None),
+                vwap=getattr(self, "vwap", None),
+                sma25=getattr(self, "sma25", None),
+                macd=getattr(self, "macd", None),
+                macd_sig=getattr(self, "macd_sig", None),
+                rsi=getattr(self, "rsi", None),
+                tick_hist=list(getattr(self, "tick_hist", [])),
+                tick_size=getattr(self, "tick_size", None),
+            ) or {}
+        except Exception:
+            feats = {}
+
+        # 直近1分のpush回数
         import time
         now = time.time()
-
-        # 直近1分のpush回数（特徴量の一つ）
         ppm = sum(1 for t in getattr(self, "push_times", []) if t >= now - 60)
 
-        # 特徴量を作成（既存の関数をそのまま利用）
-        feats = compute_features(
-            symbol=self.symbol.get().strip(),
-            last_price=self.last_price,
-            best_bid=self.best_bid,
-            best_ask=self.best_ask,
-            bid_qty=getattr(self, "bid_qty", None),   # 既存プロパティ名に合わせる
-            ask_qty=getattr(self, "ask_qty", None),
-            asks=getattr(self, "asks", None),
-            bids=getattr(self, "bids", None),
-            vwap=getattr(self, "vwap", None),
-            sma25=getattr(self, "sma25", None),
-            macd=getattr(self, "macd", None),
-            macd_sig=getattr(self, "macd_sig", None),
-            rsi=getattr(self, "rsi", None),
-            tick_hist=list(getattr(self, "tick_hist", [])),
-            tick_size=getattr(self, "tick_size", None),
-        )
-        feats["pushes_per_min"] = float(ppm)
-
-        # skip_reason が指定されていなければ、TRACEバッファから WHY: を1個だけ抽出（emit_trace 前に呼んでね）
+        # skip_reason が未指定なら TRACE から WHY: を拾う（emit_trace 前に呼ぶ前提）
         if skip_reason is None:
             skip_reason = ""
             try:
@@ -4366,27 +4598,83 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # 行を組み立て（ヘッダは start_training_log のパッチを参照）
-        tp = int(self.tp_ticks.get())
-        sl = int(self.sl_ticks.get())
-        row = [
-            feats.get("ts"),                 # 0 ts
-            feats.get("symbol"),             # 1 symbol
-            side_hint or "",                 # 2 side
-            int(label),                      # 3 label (1=ENTER, 0=SKIP)
-            skip_reason or "",               # 4 skip_reason
-            tp,                              # 5 tp_ticks
-            sl,                              # 6 sl_ticks
-        ] + [feats.get(c) for c in FEATURE_COLUMNS] + [
-            feats.get("pushes_per_min")      # 末尾に追加
-        ]
-
-        self.train_writer.writerow(row)
+        # 必須列を整備（v3）
+        ts = dt.datetime.now().isoformat(timespec="seconds")
         try:
-            # Windowsでもこまめに落ちないようflush
-            self.train_f.flush()
+            sym = (self.symbol.get() or "").strip()
         except Exception:
-            pass
+            sym = (getattr(self, "current_symbol", "") or "").strip()
+
+        # side 正規化
+        s = (side_hint or "").strip().upper()
+        side_norm = {"買":"BUY","売":"SELL","B":"BUY","S":"SELL","LONG":"BUY","SHORT":"SELL"}.get(s, s)
+        if side_norm not in ("BUY","SELL",""):
+            side_norm = ""  # SKIP等で不正なら空に落とす
+
+        # last（無ければスナップショットでフォールバック）
+        last = getattr(self, "last_price", None)
+        if last is None:
+            try:
+                self._snapshot_symbol_once()
+                last = getattr(self, "last_price", None)
+            except Exception:
+                last = None
+        if last is None:
+            # 学習スクリプト側は last 必須。取得できない時は書かない
+            self._log("TRAIN", "last_price None; skip write")
+            return
+
+        # tick_size（無ければ0.5）
+        try:
+            tick_size = float(getattr(self, "tick_size", 0.5) or 0.5)
+        except Exception:
+            tick_size = 0.5
+
+        # tp/sl（UIのスピン等から取得）
+        try:
+            tp_i = int(self.tp_ticks.get())
+            sl_i = int(self.sl_ticks.get())
+        except Exception:
+            self._log("TRAIN", "invalid tp_ticks/sl_ticks; skip write")
+            return
+
+        # FEATURE_COLUMNS を数値化（欠損は0.0）
+        def _num(v):
+            if isinstance(v, bool): return 1.0 if v else 0.0
+            try:
+                f = float(v)
+                return 0.0 if (math.isnan(f) or math.isinf(f)) else f
+            except Exception:
+                return 0.0
+
+        feat_vals = {c: _num(feats.get(c, getattr(self, c, 0.0))) for c in FEATURE_COLUMNS}
+
+        # DictWriter 用にキーで出力
+        row = {
+            "ts": ts,
+            "symbol": sym,
+            "side": side_norm,
+            "last": float(last),
+            "tick_size": float(tick_size),
+            "tp_ticks": int(tp_i),
+            "sl_ticks": int(sl_i),
+            "label": int(label),
+            "skip_reason": str(skip_reason or ""),
+            **feat_vals,
+            "pushes_per_min": float(ppm),
+        }
+
+        # ヘッダに無いキーは落として書く（念のため）
+        header = getattr(self, "_train_header", None)
+        if header:
+            row = {k: row.get(k, "") for k in header}
+
+        try:
+            # DictWriter
+            self.train_writer.writerow(row)
+            self.train_f.flush()
+        except Exception as e:
+            self._log("TRAIN", f"_log_training_row error: {e}")
 
     # ==============================
     # 資金/建玉/注文/LIVE履歴（簡易REST）
@@ -4920,22 +5208,63 @@ def _parse_cli_args():
     return args
 
 def main():
-    # 既存: App クラスはそのまま利用
+    import tkinter.messagebox as _mb
+    try:
+        if not hasattr(App, "_open_help"):
+            def _open_help(self, *args):
+                _mb.showinfo("使い方 / HELP", "このビルドにはHELP画面が未実装です。")
+            App._open_help = _open_help
+            print("HOTFIX: App._open_help を追加しました")
+    except Exception as _e:
+        print("HOTFIX 失敗:", _e)
+    print("has _open_help:", hasattr(App, "_open_help"))
+    print(__file__)
     args = _parse_cli_args()
-    app = App()  # App.__init__ 内で _build_ui() 済の前提
 
-    # 起動オプションを適用
+    # Appが tk.Tk か Frame かに依らず確実に root を用意
+    import tkinter as tk
+    try:
+        app = App()  # __init__ で super().__init__() していない可能性もあるので…
+    except Exception as e:
+        import traceback; print("App() 例外:", e); print(traceback.format_exc())
+        raise
+
+    # Tk の root を決定
+    if isinstance(app, tk.Tk):
+        root = app
+    else:
+        # Frame 等のとき
+        try:
+            root = app.winfo_toplevel()
+        except Exception:
+            root = None
+        if not isinstance(root, tk.Tk):
+            root = tk.Tk()
+            try:
+                app = App(master=root)
+                app.pack(fill="both", expand=True)
+            except Exception as e:
+                import traceback; print("App(master=root) 例外:", e); print(traceback.format_exc()); raise
+
+    # 起動オプション適用（失敗は可視化）
     try:
         app._apply_startup_options(args)
     except Exception as e:
-        app._log("CFG", f"起動オプション適用エラー: {e}")
+        print("起動オプション適用エラー:", e)
 
-    # 自動起動（トークン→登録→WS→スナップショット）
+    # 自動起動（失敗してもUIは出す）
     if getattr(args, "auto_start", False):
         import threading
-        threading.Thread(target=app._boot_seq, daemon=True).start()
+        threading.Thread(target=getattr(app, "_boot_seq", lambda: None), daemon=True).start()
 
-    app.mainloop()
+    # 念のため前面に
+    try:
+        root.deiconify(); root.lift(); root.geometry("1280x760+100+100")
+    except Exception:
+        pass
+
+    print("mainloop 開始")
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
