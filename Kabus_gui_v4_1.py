@@ -11,6 +11,7 @@ Kabus GUI V4 – Skeleton (V3互換レイヤ付き)
     python -B Kabus_gui_v4_skeleton.py
 """
 from __future__ import annotations
+from spoofing import SpoofDetector
 
 # ==== 標準・サードパーティ（V3方針を継承。必要最小限） ====
 import os
@@ -119,6 +120,15 @@ class App(CompatV3StubsJA, tk.Tk):
             "trail_to_be": True,
             "be_offset_ticks": 0,
         }
+        self.spoof_cfg = {
+            'enabled': True, 'window_ms': 3000, 'buffer_points': 150, 'k_big': 3.5,
+            'min_lifespan_ms': 80, 'flash_max_ms': 800, 'layer_levels': 5, 'layer_need': 3,
+            'layer_drop_ms': 900, 'walk_window_ms': 1400, 'walk_steps_need': 3,
+            'score_threshold': 0.70, 'suppress_weight': 0.20,
+        }
+        self.spoof = SpoofDetector(self.spoof_cfg)
+        self._last_spoof_str = ""
+        self._last_print_side = None
         # トレーリングの内部状態
         self._trail_peak = None   # ロング時: 最高値(bid)、ショート時: 最安値(ask)
         self._trail_armed = False
@@ -158,6 +168,8 @@ class App(CompatV3StubsJA, tk.Tk):
 
         self.sound_on = tk.BooleanVar(value=True)         # 「音」チェックの状態
         self.var_last_trade = tk.StringVar(value="約定：—")  # 手動スキャの「約定」表示
+
+
 
         # --- UI構築 ---
         self._build_ui()
@@ -315,17 +327,28 @@ class App(CompatV3StubsJA, tk.Tk):
         ttk.Button(bar, text="1tick進める", command=self._demo_step_once).pack(side="left", padx=(6,0))
         ttk.Button(bar, text="強制約定(最良)", command=self._demo_force_fill).pack(side="left", padx=(6,0))
 
-
         # メトリクス行：Sp/Inv/Imbalance/成行き(1m)
-        self.var_spread = tk.StringVar(value="Sp: —")     # Spread（円）
-        self.var_inv    = tk.StringVar(value="Inv: 0")    # ネットポジ
-        self.var_imbal  = tk.StringVar(value="Imb: —")    # (Bid1Qty-Ask1Qty)/(sum)*100%
+        self.var_spread = tk.StringVar(value="Sp: —")
+        self.var_inv    = tk.StringVar(value="Inv: 0")
+        self.var_imbal  = tk.StringVar(value="Imb: —")
         self.var_mkt    = tk.StringVar(value="成行: 買0 / 売0 (1m)")
-        row = ttk.Frame(tab_tape); row.pack(fill="x", padx=6)
-        ttk.Label(row, textvariable=self.var_spread).pack(side="left", padx=(0,12))
-        ttk.Label(row, textvariable=self.var_inv).pack(side="left", padx=(0,12))
-        ttk.Label(row, textvariable=self.var_imbal).pack(side="left", padx=(0,12))
-        ttk.Label(row, textvariable=self.var_mkt, style="Small.TLabel").pack(side="right")
+
+        self.metrics_bar = ttk.Frame(tab_tape); self.metrics_bar.pack(fill="x", padx=6)
+
+        # 左側：Sp/Inv/Imb
+        ttk.Label(self.metrics_bar, textvariable=self.var_spread).pack(side="left", padx=(0,12))
+        ttk.Label(self.metrics_bar, textvariable=self.var_inv).pack(side="left", padx=(0,12))
+        ttk.Label(self.metrics_bar, textvariable=self.var_imbal).pack(side="left", padx=(0,12))
+
+        # 右側グループ（右寄せの塊を作る）
+        self.metrics_right = ttk.Frame(self.metrics_bar); self.metrics_right.pack(side="right")
+
+        # 見せ板バッジ（右側）
+        self.lbl_spoof = ttk.Label(self.metrics_right, text="見せ板: なし", width=18, anchor='e')
+        self.lbl_spoof.pack(side="right", padx=(12,0))
+
+        # 成行(1m)
+        ttk.Label(self.metrics_right, textvariable=self.var_mkt, style="Small.TLabel").pack(side="right")
 
         # 左右分割：左=歩み値 / 右=ラダー
         split = ttk.Panedwindow(tab_tape, orient="horizontal"); split.pack(fill="both", expand=True, padx=6, pady=(6,8))
@@ -512,6 +535,22 @@ class App(CompatV3StubsJA, tk.Tk):
         import tkinter.scrolledtext as tkst
 
         tab_logs = ttk.Frame(tabs); tabs.add(tab_logs, text="ログ")
+        # 理由（最新）
+        self.var_reason = tk.StringVar(value="—")
+        lf_reason = ttk.LabelFrame(tab_logs, text="理由（最新）", padding=6, style="Group.TLabelframe")
+        lf_reason.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Label(lf_reason, textvariable=self.var_reason, style="Small.TLabel",
+                wraplength=1100, justify="left").pack(anchor="w")
+
+        # （既存）ログ本文
+        # 縦スクロール付きのテキスト
+        self.log_box = tkst.ScrolledText(tab_logs, wrap="none", height=12, font=("Consolas", 10))
+        self.log_box.pack(fill="both", expand=True, padx=6, pady=(6,0))
+        # 横スクロールバー
+        self.hbar = ttk.Scrollbar(tab_logs, orient="horizontal", command=self.log_box.xview)
+        self.hbar.pack(fill="x", padx=6, pady=(0,6))
+        self.log_box.configure(xscrollcommand=self.hbar.set)
+
 
         # 縦スクロール付きのテキスト
         self.log_box = tkst.ScrolledText(tab_logs, wrap="none", height=12, font=("Consolas", 10))
@@ -644,25 +683,6 @@ class App(CompatV3StubsJA, tk.Tk):
                 self._render_ladder(self._ladder_rows)
         except Exception as e:
             self._log_exc("UI", e)
-
-
-
-        lf_reason = ttk.LabelFrame(tab_log, text="理由（最新）", padding=6, style="Group.TLabelframe")
-        lf_reason.pack(fill="x", padx=6, pady=(8, 6))
-        ttk.Label(lf_reason, text="（見せ板等の理由ログは後で実装）", style="Small.TLabel", wraplength=1100, justify="left").pack(anchor="w")
-
-        lf_log = ttk.LabelFrame(tab_log, text="ログ", padding=6, style="Group.TLabelframe")
-        lf_log.pack(fill="both", expand=True, padx=6, pady=(0, 8))
-
-        # ScrolledText（垂直は内蔵 / 水平は別途付与）
-        from tkinter.scrolledtext import ScrolledText
-        self.log_box = ScrolledText(lf_log, height=12, font=("Consolas", 10), wrap="none")
-        self.log_box.pack(fill="both", expand=True)
-
-        # 水平スクロールバー
-        self.hbar = tk.Scrollbar(lf_log, orient="horizontal", command=self.log_box.xview)
-        self.hbar.pack(fill="x")
-        self.log_box.configure(xscrollcommand=self.hbar.set)
 
 
     # --------------------------------------------------
@@ -2012,6 +2032,7 @@ class App(CompatV3StubsJA, tk.Tk):
     # 歩み値：記録・1分集計（以前のものがなければ追加）
     def _append_tape(self, side:str, qty:int, price:float):
         import time
+        self._last_print_side = ('B' if side == "買成" else 'S')  # ← 追加
         ts = time.strftime("%H:%M:%S")
         if not hasattr(self, "tape"): self.tape = []
         self.tape.append((time.time(), side, int(qty), float(price)))
@@ -2182,6 +2203,13 @@ class App(CompatV3StubsJA, tk.Tk):
                 self.var_spread.set(f"Sp: {ask1p - bid1p:,.1f}")
                 tot = (bid1q or 0)+(ask1q or 0)
                 self.var_imbal.set(f"Imb: {((bid1q or 0)-(ask1q or 0))/tot*100:+.1f}%") if tot>0 else self.var_imbal.set("Imb: —")
+            st = self.spoof.update(
+                ts_ms=int(time.time()*1000),
+                best_bid=bid1p, best_ask=ask1p, best_bidq=bid1q, best_askq=ask1q,
+                levels={'B': buys, 'S': sells},
+                last_trade={'side': getattr(self, '_last_print_side', None)}
+            )
+            self.lbl_spoof.configure(text=f"見せ板: {self.spoof.format_badge(st)}")   
         except Exception as e:
             self._log_exc("DRV", e)
 
@@ -2799,6 +2827,17 @@ class App(CompatV3StubsJA, tk.Tk):
                     # ノイズ抑制：INVやスプレッド等の条件が同じ場合は間引き可（dedup_key）
                     self._auto_log("見送り", reason, q, m)
                     continue
+                # act == "ENTRY" のときだけ
+                if act == "ENTRY":
+                    allow, _adj, msg = self.spoof.apply_gate(
+                        proposed_side=('B' if side=='BUY' else 'S'),
+                        entry_confidence=1.0
+                    )
+                    if not allow:
+                        self._auto_log("見送り", f"見せ板ゲート: {msg}", q, m)
+                        continue
+                    if msg:
+                        self._auto_log("AUTO", f"見せ板ゲート: {msg}", q, m)
 
                 # 指値発注
                 with self._auto_lock:
